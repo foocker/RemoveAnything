@@ -8,7 +8,6 @@ import cv2
 from .data_utils import * 
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
-from torchvision import transforms, utils
 import bezier
 import random
 import torchvision.transforms as T
@@ -38,23 +37,18 @@ class BaseDataset(Dataset):
         removed_mask: removed object 被擦除对象对应的mask
         removed_image: 擦除后的效果
         '''
-        # 获取被擦除对象的外框
         remove_box_yyxx = get_bbox_from_mask(removed_mask)
         
-        # 将原始输入图像作为参考图像，需要擦除的物体作为参考对象
         ref_mask_3 = np.stack([removed_mask, removed_mask, removed_mask], -1)
-        # 提取需要被擦除的物体
         masked_ref_image = input_image * ref_mask_3 + np.ones_like(input_image) * 255 * (1-ref_mask_3)
         
         y1, y2, x1, x2 = remove_box_yyxx
         masked_ref_image = masked_ref_image[y1:y2, x1:x2, :]
         ref_mask = removed_mask[y1:y2, x1:x2]
         
-        # 稍微扩大参考物体图像
         ratio = np.random.randint(11, 15) / 10
         masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio)
         
-        # 将参考图像填充为正方形并缩放到指定大小
         masked_ref_image = pad_to_square(masked_ref_image, pad_value=255, random=False)
         masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
         
@@ -65,17 +59,13 @@ class BaseDataset(Dataset):
         y1, y2, x1, x2 = remove_box_yyxx
         e_y1, e_y2, e_x1, e_x2 = expand_remove_box_yyxx
         
-        if self.data_type == "person":
-            prob_bezier = 0.4
-            prob_box = 0.8
-        else:
-            prob_bezier = 0.5
-            prob_box = 1.0
+        # TODO 不同类型，概率不同
+        prob_bezier = 0.4
+        prob_box = 0.8
             
         prob = random.uniform(0, 1)
         
         if prob <= prob_bezier:
-            # 使用贝塞尔曲线创建蒙版
             tar_mask = Image.new('RGB', (input_image.shape[1], input_image.shape[0]), (0, 0, 0))
             top_nodes = np.asfortranarray([
                 [x1, (x1+x2)/2, x2],
@@ -135,12 +125,10 @@ class BaseDataset(Dataset):
             tar_mask = np.array(tar_mask)
             
         elif prob > prob_bezier and prob <= prob_box:
-            # 使用扩大的边界框创建蒙版
             tar_mask = np.zeros_like(input_image, dtype=np.uint8)
             tar_mask[e_y1:e_y2, e_x1:e_x2] = 255
             
         else:
-            # 使用原始蒙版，但进行扩张
             tar_mask = removed_mask.copy()
             tar_mask[tar_mask == 1] = 255
             
@@ -149,20 +137,16 @@ class BaseDataset(Dataset):
             tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
             tar_mask = np.stack([tar_mask, tar_mask, tar_mask], -1)
         
-        # 创建源图像 - 原始图像中被遮挡的部分
         masked_task_image = input_image * (1-(tar_mask == 255))  # 
         masked_task_image = pad_to_square(masked_task_image, pad_value=255, random=False).astype(np.uint8)
         masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), size).astype(np.uint8)
         
-        # 目标图像 - 擦除后的图像
         tar_image = pad_to_square(removed_image, pad_value=255, random=False).astype(np.uint8)
         tar_image = cv2.resize(tar_image.astype(np.uint8), size).astype(np.uint8)
         
-        # 处理mask
         tar_mask = pad_to_square(tar_mask, pad_value=0, random=False).astype(np.uint8)
         tar_mask = cv2.resize(tar_mask.astype(np.uint8), size).astype(np.uint8)
         
-        # 创建diptych格式的图像和mask
         mask_black = np.ones_like(tar_image) * 0
         # 纯黑+消除物体扩张后的mask
         diptych_mask = self.to_tensor(np.concatenate([mask_black, tar_mask], axis=1)) 
@@ -173,7 +157,6 @@ class BaseDataset(Dataset):
         # 被消除物体扩张填白裁剪后的图像
         masked_ref_image = self.to_tensor(masked_ref_image)
         
-        # 返回处理后的字典
         item = dict(
             ref=masked_ref_image,   # 被擦除物体的参考图像
             src=diptych_src,        # 源图像（参考物体 + 带消除物体的mask的原始图像）

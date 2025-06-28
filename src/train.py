@@ -207,7 +207,7 @@ def parse_args():
     return args
 
     
-def log_infer(accelerator, args, save_path,epoch, global_step, 
+def log_infer(accelerator, args, save_path, epoch, global_step, 
               pipefill: FluxFillPipeline, pipeprior: FluxPriorReduxPipeline):
     """
     执行推理并记录结果,这里可以没有edited_image

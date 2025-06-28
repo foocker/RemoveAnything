@@ -1,12 +1,12 @@
 #!/bin/bash
 # 这个脚本用于从JSON映射文件生成Arrow格式的数据文件
-# 使用方法: ./run.sh <json_path> <output_dir> [num_processes] [samples_per_file]
+# 使用方法: ./train.sh <json_path> <output_dir> [num_processes] [samples_per_file]
 
 set -e
 
 # 设置默认值
-JSON_PATH=${1:-"/aicamera-mlp/fq_proj/datasets/Eraser/flickr_commodity_stuff/gt_added_mapping.json"}
-OUTPUT_DIR=${2:-"/aicamera-mlp/fq_proj/datasets/Eraser/flickr_commodity_stuff/arrow"}
+JSON_PATH=${1:-"/xx.json"}
+OUTPUT_DIR=${2:-"/xx/arrow"}
 NUM_PROCESSES=${3:-8}
 SAMPLES_PER_FILE=${4:-2000}
 

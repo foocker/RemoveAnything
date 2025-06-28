@@ -5,28 +5,68 @@ import numpy as np
 import cv2
 from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
 from data.data_utils import get_bbox_from_mask, expand_bbox, pad_to_square, box2squre, crop_back, expand_image_mask
-import time 
+import time
+import argparse
+
+# Parse command line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description="RemoveAnything inference script")
+    
+    # Model paths
+    parser.add_argument("--flux_fill_path", type=str, 
+                        default="",
+                        help="Path to FLUX Fill model")
+    parser.add_argument("--lora_weights_path", type=str, 
+                        default="",
+                        help="Path to LoRA weights")
+    parser.add_argument("--flux_redux_path", type=str, 
+                        default="",
+                        help="Path to FLUX Redux model")
+    
+    # Image and mask paths
+    parser.add_argument("--source_image", type=str, 
+                        default="examples/source_image/xx.png",
+                        help="Path to source image")
+    parser.add_argument("--source_mask", type=str, 
+                        default="examples/source_mask/xx_mask.png",
+                        help="Path to source mask")
+    
+    # Output path
+    parser.add_argument("--output_dir", type=str, 
+                        default="./results",
+                        help="Directory to save results")
+    
+    # Inference parameters
+    parser.add_argument("--seed", type=int, default=666, help="Random seed for generation")
+    parser.add_argument("--size", type=int, default=768, 
+                        choices=[512, 768, 1024],
+                        help="Image size for processing")
+    parser.add_argument("--num_inference_steps", type=int, default=30,
+                        help="Number of inference steps")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Number of times to repeat inference")
+    
+    return parser.parse_args()
+
+args = parse_args()
 
 device = torch.device(f"cuda")
 dtype = torch.bfloat16
-# size = (512, 512)
-size = (768, 768)
-# size = (1024, 1024)
+size = (args.size, args.size)
 
-# Load the pre-trained model and LoRA weights
-# Please replace the paths with your own paths
+# Load the pre-trained model and LoRA weights from command line arguments
 pipe = FluxFillPipeline.from_pretrained(
-    "/aicamera-mlp/fq_proj/weights/modelscope/FLUX.1-Fill-dev",
+    args.flux_fill_path,
     torch_dtype=dtype,
     use_safetensors=True
 )
 
 pipe.load_lora_weights(
-    "/aicamera-mlp/fq_proj/weights/hf/WensongSong/Insert-Anything"
+    args.lora_weights_path
 )
 
 redux = FluxPriorReduxPipeline.from_pretrained(
-    "/aicamera-mlp/fq_proj/weights/modelscope/FLUX.1-Redux-dev"
+    args.flux_redux_path
 ).to(dtype=dtype)
 
 # If you want to reduce GPU memory usage, please comment out the following two lines and uncomment the next three lines.
@@ -39,20 +79,16 @@ redux.to(device)
 # redux.enable_model_cpu_offload()
 
 
-# Load the source and reference images and masks
-# Please replace the paths with your own image and mask paths
-source_image_path = "examples/source_image/000004.png"
-mask_image_path = "examples/source_mask/000004_aligned_mask.png"
-
-ref_image_path = "examples/ref_image/00024_alpha.png"
-ref_mask_path = "examples/ref_mask/00024.png"
+# Load the source and reference images and masks from command line arguments
+source_image_path = args.source_image
+mask_image_path = args.source_mask
 
 # Load the images and masks
-ref_image = cv2.imread(ref_image_path)
+ref_image = cv2.imread(source_image_path)
 ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
 tar_image = cv2.imread(source_image_path)
 tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
-ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
+ref_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
 tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
 tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
 
@@ -109,9 +145,9 @@ diptych_ref_tar = Image.fromarray(diptych_ref_tar)
 mask_diptych[mask_diptych == 1] = 255
 mask_diptych = Image.fromarray(mask_diptych)
 
-seeds = [666]
-repeat = 1
-num_inference_steps = 30  # 1024-> 20:55s, 30:83s, 50:137s; 768-> 10:14s ,20:28s, 30:43s, 50:71s
+seeds = [args.seed]
+repeat = args.repeat
+num_inference_steps = args.num_inference_steps  # 1024-> 20:55s, 30:83s, 50:137s; 768-> 10:14s ,20:28s, 30:43s, 50:71s
 for seed in seeds:
     generator = torch.Generator(device).manual_seed(seed)
     for i in range(repeat):
@@ -145,7 +181,7 @@ for seed in seeds:
     ref_without_ext = os.path.splitext(ref_with_ext)[0]
     tar_without_ext = os.path.splitext(tar_with_ext)[0]
     
-    save_path = "./results"
+    save_path = args.output_dir
     os.makedirs(save_path, exist_ok=True)
     edited_image_save_path = os.path.join(save_path, f"{ref_without_ext}_to_{tar_without_ext}_seed{seed}_{num_inference_steps}_{size[0]}.png")
     edited_image.save(edited_image_save_path)

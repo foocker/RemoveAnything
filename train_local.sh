@@ -4,16 +4,15 @@
 export CUDA_VISIBLE_DEVICES=0
 
 # 数据路径
-TRAIN_JSON_PATH="/xx/data/removal/train.json"
+TRAIN_JSON_PATH="/aicamera-mlp/fq_proj/datasets/Eraser/open_ROREM_RORD_COCO/gt_added_mapping.json"
 VAL_JSON_PATH="/xx/data/removal/val.json"
-TRAIN_DATA_DIR="/xx/data/removal"
 
 # 输出路径
-OUTPUT_DIR="/xx/outputs/removal"
+OUTPUT_DIR="/aicamera-mlp/fq_proj/results/removal_flux_lora"
 
 # 模型参数
-FLUX_FILL_ID="stabilityai/flux-fill"
-FLUX_REDUX_ID="stabilityai/flux-prior-redux"
+FLUX_FILL_ID="/aicamera-mlp/fq_proj/weights/modelscope/FLUX.1-Fill-dev"
+FLUX_REDUX_ID="/aicamera-mlp/fq_proj/weights/modelscope/FLUX.1-Redux-dev"
 RESOLUTION=768
 
 # 训练参数
@@ -26,15 +25,17 @@ CHECKPOINT_STEPS=1000
 
 # LoRA参数
 USE_LORA=true
-LORA_R=32
-LORA_ALPHA=32
+LORA_R=64
+LORA_ALPHA=64
+LORA_DROPOUT=0.0
+TARGET_MODULES="(.*x_embedder|.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_v|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_out\.0|.*(?<!single_)transformer_blocks\.[0-9]+\.ff\.net\.2|.*single_transformer_blocks\.[0-9]+\.norm\.linear|.*single_transformer_blocks\.[0-9]+\.proj_mlp|.*single_transformer_blocks\.[0-9]+\.proj_out|.*single_transformer_blocks\.[0-9]+\.attn.to_k|.*single_transformer_blocks\.[0-9]+\.attn.to_q|.*single_transformer_blocks\.[0-9]+\.attn.to_v|.*single_transformer_blocks\.[0-9]+\.attn.to_out)"
 
 
 # 创建输出目录
 mkdir -p $OUTPUT_DIR
 
 # 运行训练脚本
-python src/train.py \
+accelerate launch src/train.py \
   --train_json_path $TRAIN_JSON_PATH \
   --val_json_path $VAL_JSON_PATH \
   --output_dir $OUTPUT_DIR \
