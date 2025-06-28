@@ -1,2 +1,3 @@
 train_local.sh
 infer_local.sh
+.idea
