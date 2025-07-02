@@ -1,3 +1,7 @@
 train_local.sh
 infer_local.sh
+train_local_dis.sh
 .idea
+**/__pycache__/
+change.txt
+src/train_dual_control.py

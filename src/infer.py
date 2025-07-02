@@ -8,7 +8,6 @@ from data.data_utils import get_bbox_from_mask, expand_bbox, pad_to_square, box2
 import time
 import argparse
 
-# Parse command line arguments
 def parse_args():
     parser = argparse.ArgumentParser(description="RemoveAnything inference script")
     
@@ -59,11 +58,15 @@ pipe = FluxFillPipeline.from_pretrained(
     args.flux_fill_path,
     torch_dtype=dtype,
     use_safetensors=True
-)
+).to(dtype=dtype)
+
+# Force disable xformers
+if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+    pipe._use_memory_efficient_attention_xformers = False
 
 pipe.load_lora_weights(
     args.lora_weights_path
-)
+).to(dtype=dtype)
 
 redux = FluxPriorReduxPipeline.from_pretrained(
     args.flux_redux_path
@@ -176,12 +179,13 @@ for seed in seeds:
     edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
     edited_image = Image.fromarray(edited_image)
 
-    ref_with_ext = os.path.basename(ref_mask_path)
+    # Get the filenames without paths and extensions for saving results
+    source_with_ext = os.path.basename(source_image_path)
     tar_with_ext = os.path.basename(mask_image_path)
-    ref_without_ext = os.path.splitext(ref_with_ext)[0]
+    source_without_ext = os.path.splitext(source_with_ext)[0]
     tar_without_ext = os.path.splitext(tar_with_ext)[0]
     
     save_path = args.output_dir
     os.makedirs(save_path, exist_ok=True)
-    edited_image_save_path = os.path.join(save_path, f"{ref_without_ext}_to_{tar_without_ext}_seed{seed}_{num_inference_steps}_{size[0]}.png")
+    edited_image_save_path = os.path.join(save_path, f"{source_without_ext}_to_{tar_without_ext}_seed{seed}_{num_inference_steps}_{size[0]}.png")
     edited_image.save(edited_image_save_path)

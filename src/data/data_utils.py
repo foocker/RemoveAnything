@@ -105,8 +105,12 @@ def get_bbox_from_mask(mask):
 def expand_bbox(mask, yyxx, ratio=[1.2,2.0], min_crop=0):
     y1,y2,x1,x2 = yyxx
     H,W = mask.shape[0], mask.shape[1]
-    ratio = np.random.randint( ratio[0] * 10,  ratio[1] * 10 ) / 10
-
+    
+    # Handle both single float and range values for ratio
+    if isinstance(ratio, (list, tuple, np.ndarray)) and len(ratio) >= 2:
+        # If ratio is a range, randomly select a value within the range
+        ratio = np.random.randint(ratio[0] * 10, ratio[1] * 10) / 10
+    # If ratio is already a single value, use it directly
 
     xc, yc = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
     h = ratio * (y2-y1+1)

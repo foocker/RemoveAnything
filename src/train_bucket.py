@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # coding=utf-8
 
+import json
 import os
 import argparse
 import logging
 import math
-import gc
 import time
+import gc
 import numpy as np
 import torch
 import torch.utils.checkpoint
@@ -20,10 +21,16 @@ from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm.auto import tqdm
 
-from data.all_data import load_triplet_paths, TripletsData
+from data.all_data import load_triplet_paths
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
 from models.image_project import image_output
 from models.transformer import tranformer_forward
+from data.triplet_bucket_dataset import TripletBucketDataset, triplet_collate_fn
+from data.bucket_utils import BucketBatchSampler
+from data.bucket_utils import (
+    parse_buckets_string,
+    find_nearest_bucket
+)
 
 from PIL import Image
 import cv2
@@ -36,26 +43,220 @@ from data.data_utils import (
     crop_back
 )
 
+
 logger = get_logger(__name__, log_level="INFO")
 
 
+def log_infer(accelerator, args, save_path, epoch, global_step, 
+              pipefill: FluxFillPipeline, pipeprior: FluxPriorReduxPipeline):
+    # 设置所有模型组件都使用BFloat16
+    model_dtype = torch.bfloat16
+    logger.info(f"Setting all model components to use {model_dtype}")
+    
+    # 重编VAE的_decode方法以确保类型一致性
+    if hasattr(pipefill, "vae") and hasattr(pipefill.vae, "_decode"):
+        # 保存原始方法
+        original_decode = pipefill.vae._decode
+        
+        def patched_decode(z):
+            # 确保所有输入和模型参数都使用相同类型
+            z = z.to(dtype=model_dtype)
+            # 临时将所有decoder组件转换为一致类型
+            with torch.no_grad():
+                for name, module in pipefill.vae.decoder.named_modules():
+                    if hasattr(module, "weight") and module.weight is not None:
+                        if module.weight.dtype != model_dtype:
+                            module.weight.data = module.weight.data.to(model_dtype)
+                    if hasattr(module, "bias") and module.bias is not None:
+                        if module.bias.dtype != model_dtype:
+                            module.bias.data = module.bias.data.to(model_dtype)
+                
+                # 调用原始方法
+                try:
+                    return original_decode(z)
+                except Exception as e:
+                    logger.warning(f"Error in patched decode: {e}")
+                    # 如果失败，尝试使用float32
+                    logger.info("Falling back to float32 for this operation")
+                    z_float = z.to(dtype=torch.float32)
+                    # 将decoder暂时转换为float32
+                    pipefill.vae.decoder = pipefill.vae.decoder.to(dtype=torch.float32)
+                    result = original_decode(z_float)
+                    # 还原为原始类型
+                    pipefill.vae.decoder = pipefill.vae.decoder.to(dtype=model_dtype)
+                    return result
+        
+        # 替换方法
+        pipefill.vae._decode = patched_decode
+        logger.info("Successfully patched VAE decoder method")
+    
+    # 将所有模型转换为BFloat16
+    pipefill.to(dtype=model_dtype)
+    pipeprior.to(dtype=model_dtype)
+    """
+    执行简化版推理，只展示输入图像和mask用于调试
+    """
+    set_seed(42)
+    logger.info(f"Running inference... \nEpoch: {epoch}, Step: {global_step}")
+    save_dir = os.path.join(save_path, f"infer_seed{42}")
+    os.makedirs(save_dir, exist_ok=True)
+    triplet_paths = load_triplet_paths(args.val_json_path)
+    # size = (args.resolution, args.resolution)
+    buckets = parse_buckets_string(args.aspect_ratio_buckets)
+
+    for paths in triplet_paths:
+        source_image_path = paths["input_image"]  # 被消除
+        mask_image_path = paths["mask"]  # 待消除区域
+        file_name = os.path.basename(source_image_path)
+        removed_image_path = paths["edited_image"] if os.path.exists(paths["edited_image"]) else source_image_path # 消除后的结果 
+
+        ref_image_path = removed_image_path
+        ref_mask_path = mask_image_path
+
+        ref_image = cv2.imread(ref_image_path)
+        h, w = ref_image.shape[:2]
+        target_size = buckets[find_nearest_bucket(h, w, buckets)]
+        ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+        tar_image = cv2.imread(source_image_path)
+        tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
+        ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
+        tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
+
+        if tar_mask.shape != tar_image.shape:
+            tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
+
+        ref_box_yyxx = get_bbox_from_mask(ref_mask)
+        ref_mask_3 = np.stack([ref_mask,ref_mask,ref_mask],-1)
+        masked_ref_image = ref_image * ref_mask_3 + np.ones_like(ref_image) * 255 * (1-ref_mask_3) 
+        y1,y2,x1,x2 = ref_box_yyxx
+        masked_ref_image = masked_ref_image[y1:y2,x1:x2,:] 
+        ref_mask = ref_mask[y1:y2,x1:x2] 
+        ratio = 1.3
+        masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio) 
+
+        masked_ref_image = pad_to_square(masked_ref_image, pad_value = 255, random = False) 
+
+        # kernel = np.ones((7, 7), np.uint8)
+        # iterations = 2
+        # tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
+
+        # zome in
+        tar_box_yyxx = get_bbox_from_mask(tar_mask)
+        # tar_box_yyxx_crop: 越大，对消除任务更友好(应该，否则优化建模思路，条件引导优化)
+        tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=1.5)    #1.2 1.6,
+        tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop) # crop box
+        y1,y2,x1,x2 = tar_box_yyxx_crop
+
+        old_tar_image = tar_image.copy()
+
+        tar_image = tar_image[y1:y2,x1:x2,:]
+        tar_mask = tar_mask[y1:y2,x1:x2]
+
+        H1, W1 = tar_image.shape[0], tar_image.shape[1]
+        # zome in
+        tar_mask = pad_to_square(tar_mask, pad_value=0)
+        tar_mask = cv2.resize(tar_mask, target_size)
+
+        masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), target_size).astype(np.uint8)
+        
+        # 确保pipeprior也使用正确的数据类型
+        with torch.no_grad():
+            pipe_prior_output = pipeprior(Image.fromarray(masked_ref_image))
+        
+        # 转换pipe_prior_output中的所有张量到与模型相同的数据类型
+        for key, value in pipe_prior_output.items():
+            if isinstance(value, torch.Tensor):
+                pipe_prior_output[key] = value.to(dtype=model_dtype)
+
+        tar_image = pad_to_square(tar_image, pad_value=255)
+        H2, W2 = tar_image.shape[0], tar_image.shape[1]
+
+        tar_image = cv2.resize(tar_image, target_size)
+        diptych_ref_tar = np.concatenate([masked_ref_image, tar_image], axis=1)
+
+        tar_mask = np.stack([tar_mask, tar_mask, tar_mask], -1)
+        mask_black = np.ones_like(tar_image) * 0
+        mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
+
+        diptych_ref_tar = Image.fromarray(diptych_ref_tar)
+        mask_diptych[mask_diptych == 1] = 255
+        mask_diptych = Image.fromarray(mask_diptych)
+
+        generator = torch.Generator(accelerator.device,).manual_seed(42)
+        edited_image = pipefill(
+            image=diptych_ref_tar,
+            mask_image=mask_diptych,
+            height=mask_diptych.size[1],
+            width=mask_diptych.size[0],
+            max_sequence_length=512,
+            num_inference_steps=30,
+            generator=generator,
+            **pipe_prior_output,  # Use the output from the prior redux model
+        ).images[0]
+
+        t_width, t_height = edited_image.size
+        start_x = t_width // 2
+        edited_image = edited_image.crop((start_x, 0, t_width, t_height))
+
+        edited_image = np.array(edited_image)
+        edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
+        edited_image = Image.fromarray(edited_image)
+
+        # Save the result
+        edited_image_save_path = os.path.join(save_dir, f"seed{42}_epoch_{epoch}_step_{global_step}_{file_name}")
+        edited_image.save(edited_image_save_path)
+        
+    del pipefill, pipeprior
+    torch.cuda.empty_cache()
+    gc.collect()
+
+PREFERRED_KONTEXT_RESOLUTIONS = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="训练模型执行移除任务")
+    parser = argparse.ArgumentParser(description="使用LazyBucket数据集训练模型执行移除任务")
     
     # 数据参数
     parser.add_argument("--train_json_path", type=str, required=True, 
                         help="训练数据的JSON路径")
     parser.add_argument("--val_json_path", type=str, required=True, 
                         help="验证数据的JSON路径")
-    parser.add_argument("--train_data_dir", type=str, required=True, 
-                        help="训练数据目录，包含input、mask和result子目录")
     parser.add_argument("--resolution", type=int, default=768, 
                         help="训练图像分辨率")
     parser.add_argument("--center_crop", action="store_true", default=False, 
                         help="是否中心裁剪图像")
     parser.add_argument("--random_flip", action="store_true", default=False, 
                         help="是否随机翻转图像")
-    
+    # Bucket 参数
+    parser.add_argument(
+        "--aspect_ratio_buckets",
+        type=str,
+        default=None,
+        help=(
+            "Aspect ratio buckets to use for training. Define as a string of 'h1,w1;h2,w2;...'. "
+            "e.g. '1024,1024;768,1360;1360,768;880,1168;1168,880;1248,832;832,1248'"
+            "Images will be resized and cropped to fit the nearest bucket. If provided, --resolution is ignored."
+        ),
+    )
+    parser.add_argument("--train_metadata_file", type=str, default=None,
+                        help="预计算的元数据文件路径，加速数据集加载")
     # 基本训练参数
     parser.add_argument("--output_dir", type=str, default="outputs/removal", 
                         help="模型保存路径")
@@ -69,7 +270,6 @@ def parse_args():
                         help="日志保存路径")
     parser.add_argument("--allow_tf32", action="store_true", default=False,
                         help="是否允许使用 TF32 格式，可加速训练")
-    
     
     # 模型参数
     parser.add_argument("--flux_fill_id", type=str, default="stabilityai/flux-fill",
@@ -90,10 +290,8 @@ def parse_args():
                         help="启用latent_lora")
     
     # LoRA参数
-    parser.add_argument("--use_lora", action="store_true", dest="use_lora", default=True,
+    parser.add_argument("--use_lora", type=bool, default=True,
                         help="启用LoRA微调")
-    parser.add_argument("--no_lora", action="store_false", dest="use_lora",
-                        help="不使用LoRA微调")
     parser.add_argument("--lora_r", type=int, default=256, 
                         help="LoRA的秩")
     parser.add_argument("--lora_alpha", type=int, default=256, 
@@ -154,7 +352,7 @@ def parse_args():
     parser.add_argument("--dataloader_num_workers", type=int, default=4, 
                         help="数据加载线程数")
     parser.add_argument("--enable_xformers_memory_efficient_attention", 
-                        action="store_true", default=True, 
+                        action="store_true", default=False, 
                         help="是否启用xformers内存优化注意力机制")
     
     # 解析参数
@@ -170,18 +368,6 @@ def parse_args():
         "add_cond_attn": args.add_cond_attn,
         "latent_lora": args.latent_lora
     }
-    
-    # 创建LoRA配置字典
-    if args.use_lora:
-        args.lora_config_dict = {
-            "r": args.lora_r,
-            "lora_alpha": args.lora_alpha,
-            "lora_dropout": args.lora_dropout,
-            "bias": args.lora_bias,
-            "target_modules": args.target_modules
-        }
-    else:
-        args.lora_config_dict = None
     
     # 创建优化器配置字典
     if args.optimizer_config is None:
@@ -200,131 +386,24 @@ def parse_args():
                 "type": "AdamW"
             }
     
-    # 输出关键配置信息
-    logger.info(f"已配置参数: output_dir={args.output_dir}, lr={args.learning_rate}, batch_size={args.train_batch_size}")
-    logger.info(f"LoRA配置: use_lora={args.use_lora}, r={args.lora_r}, alpha={args.lora_alpha}")
-    
     return args
-
-    
-def log_infer(accelerator, args, save_path, epoch, global_step, 
-              pipefill: FluxFillPipeline, pipeprior: FluxPriorReduxPipeline):
-    """
-    执行推理并记录结果,这里可以没有edited_image
-    """
-    set_seed(42)
-    logger.info(f"Running inference... \nEpoch: {epoch}, Step: {global_step}")
-    os.makedirs(os.path.join(save_path, f"infer_seed{42}"), exist_ok=True)
-    triplet_paths = load_triplet_paths(args.val_json_path)
-    size = (args.resolution, args.resolution)
-    
-    for paths in triplet_paths:
-        source_image_path = paths["input_image"]  # 被消除
-        mask_image_path = paths["mask"]  # 待消除区域
-        file_name = os.path.basename(source_image_path)
-        removed_image_path = paths["edited_image"] if os.path.exists(paths["edited_image"]) else source_image_path # 消除后的结果 
-
-        ref_image_path = removed_image_path
-        ref_mask_path = mask_image_path
-
-        ref_image = cv2.imread(ref_image_path)
-        ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
-        tar_image = cv2.imread(source_image_path)
-        tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
-        ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
-        tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
-
-        if tar_mask.shape != tar_image.shape:
-            tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
-
-        ref_box_yyxx = get_bbox_from_mask(ref_mask)
-        ref_mask_3 = np.stack([ref_mask,ref_mask,ref_mask],-1)
-        masked_ref_image = ref_image * ref_mask_3 + np.ones_like(ref_image) * 255 * (1-ref_mask_3) 
-        y1,y2,x1,x2 = ref_box_yyxx
-        masked_ref_image = masked_ref_image[y1:y2,x1:x2,:] 
-        ref_mask = ref_mask[y1:y2,x1:x2] 
-        ratio = 1.3
-        masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio) 
-
-        masked_ref_image = pad_to_square(masked_ref_image, pad_value = 255, random = False) 
-
-        # kernel = np.ones((7, 7), np.uint8)
-        # iterations = 2
-        # tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
-
-        # zome in
-        tar_box_yyxx = get_bbox_from_mask(tar_mask)
-        # tar_box_yyxx_crop: 越大，对消除任务更友好(应该，否则优化建模思路，条件引导优化)
-        tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=2)    #1.2 1.6,
-        tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop) # crop box
-        y1,y2,x1,x2 = tar_box_yyxx_crop
-
-        old_tar_image = tar_image.copy()
-
-        tar_image = tar_image[y1:y2,x1:x2,:]
-        tar_mask = tar_mask[y1:y2,x1:x2]
-
-        H1, W1 = tar_image.shape[0], tar_image.shape[1]
-        # zome in
-        tar_mask = pad_to_square(tar_mask, pad_value=0)
-        tar_mask = cv2.resize(tar_mask, size)
-
-        masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
-        pipe_prior_output = pipeprior(Image.fromarray(masked_ref_image))
-
-        tar_image = pad_to_square(tar_image, pad_value=255)
-        H2, W2 = tar_image.shape[0], tar_image.shape[1]
-
-        tar_image = cv2.resize(tar_image, size)
-        diptych_ref_tar = np.concatenate([masked_ref_image, tar_image], axis=1)
-
-        tar_mask = np.stack([tar_mask, tar_mask, tar_mask], -1)
-        mask_black = np.ones_like(tar_image) * 0
-        mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
-
-        diptych_ref_tar = Image.fromarray(diptych_ref_tar)
-        mask_diptych[mask_diptych == 1] = 255
-        mask_diptych = Image.fromarray(mask_diptych)
-
-        generator = torch.Generator(accelerator.device,).manual_seed(42)
-        edited_image = pipefill(
-            image=diptych_ref_tar,
-            mask_image=mask_diptych,
-            height=mask_diptych.size[1],
-            width=mask_diptych.size[0],
-            max_sequence_length=512,
-            generator=generator,
-            **pipe_prior_output,  # Use the output from the prior redux model
-        ).images[0]
-
-        t_width, t_height = edited_image.size
-        start_x = t_width // 2
-        edited_image = edited_image.crop((start_x, 0, t_width, t_height))
-
-        edited_image = np.array(edited_image)
-        edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
-        edited_image = Image.fromarray(edited_image)
-
-        # Save the result
-        edited_image_save_path = os.path.join(save_path, f"seed{42}_{file_name}")
-        edited_image.save(edited_image_save_path)
-        
-    del pipefill, pipeprior
-    torch.cuda.empty_cache()
-    gc.collect()
 
 
 def main():
+    # Initialize PartialState before any logging
+    from accelerate.state import PartialState
+    _ = PartialState()  # 为啥，后续看 TODO
+    
     args = parse_args()
+    
+    # 输出关键配置信息
+    logger.info(f"已配置参数: output_dir={args.output_dir}, lr={args.learning_rate}, batch_size={args.train_batch_size}")
+    logger.info(f"LoRA配置: use_lora={args.use_lora}, r={args.lora_r}, alpha={args.lora_alpha}")
     
     # 创建日志和输出目录
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(logging_dir, exist_ok=True)
-    
-    # 添加保存LoRA的目录
-    lora_dir = os.path.join(args.output_dir, "lora_weights")
-    os.makedirs(lora_dir, exist_ok=True)
     
     # 初始化accelerator
     accelerator_project_config = ProjectConfiguration(
@@ -370,37 +449,63 @@ def main():
         torch_dtype=weight_dtype
     )
     
+    # 强制禁用xformers
+    if hasattr(flux_fill_pipe, "enable_xformers_memory_efficient_attention"):
+        flux_fill_pipe._use_memory_efficient_attention_xformers = False
+        
+    # 确保 VAE 使用正确的数据类型, 训练的稳定性来说，vae应该使用float32 # TODO 后续验证
+    if hasattr(flux_fill_pipe, "vae"):
+        flux_fill_pipe.vae = flux_fill_pipe.vae.to(dtype=flux_fill_pipe.dtype)
+    # Move model to the appropriate device
+    flux_fill_pipe.to(accelerator.device)
+    
     logger.info(f"Loading FluxPriorReduxPipeline model: {args.flux_redux_id}")
     flux_redux_pipe = FluxPriorReduxPipeline.from_pretrained(
         args.flux_redux_id,
         torch_dtype=weight_dtype
     )
+    # Move models to the appropriate device
+    flux_redux_pipe.to(accelerator.device)
+    flux_redux_pipe.image_embedder.requires_grad_(False).eval()
+    flux_redux_pipe.image_encoder.requires_grad_(False).eval()
     
     vae = flux_fill_pipe.vae
     text_encoder = flux_fill_pipe.text_encoder
     text_encoder_2 = flux_fill_pipe.text_encoder_2
     transformer = flux_fill_pipe.transformer
     
-    flux_redux_pipe.image_embedder.requires_grad_(False).eval()
-    flux_redux_pipe.image_encoder.requires_grad_(False).eval()
-    
     vae.requires_grad_(False).eval()
     text_encoder.requires_grad_(False).eval()
     text_encoder_2.requires_grad_(False).eval()
+    transformer.requires_grad_(False)
     
     if args.use_lora:
         logger.info("Using LoRA for training transformer")
+        # TODO from flux kontext
+        target_modules = [
+            "attn.to_k",
+            "attn.to_q",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_k_proj",
+            "attn.add_q_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
+        ]
+
         lora_config_dict = {
             "r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "init_lora_weights": args.init_lora_weights,
-            "target_modules": args.target_modules
+            "target_modules": target_modules
         }
         
         transformer.add_adapter(LoraConfig(**lora_config_dict))
         transformer.gradient_checkpointing = args.gradient_checkpointing
-        
-        transformer.requires_grad_(False)
         
         trainable_params = list(filter(
             lambda p: p.requires_grad, transformer.parameters()
@@ -413,11 +518,11 @@ def main():
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
     
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            transformer.enable_xformers_memory_efficient_attention()  # TODO 待查transformer是否有这个方法
-        else:
-            logger.warning("xformers not available, memory efficient attention not enabled")
+    # if args.enable_xformers_memory_efficient_attention:
+    #     if is_xformers_available():
+    #         transformer.enable_xformers_memory_efficient_attention()  # TODO 待查transformer是否有这个方法
+    #     else:
+    #         logger.warning("xformers not available, memory efficient attention not enabled")
     
     optimizer_type = args.optimizer_config.get("type", "AdamW")
     optimizer_params = args.optimizer_config.get("params", {})
@@ -452,17 +557,58 @@ def main():
         )
         logger.info(f"使用AdamW优化器，参数: {{在args中的参数: lr={args.learning_rate}, betas=({args.adam_beta1}, {args.adam_beta2}), weight_decay={args.adam_weight_decay}, eps={args.adam_epsilon}}}")
     
-    train_dataset = TripletsData(json_path=args.train_json_path)
+    buckets = parse_buckets_string(args.aspect_ratio_buckets)
     
-    if len(train_dataset) == 0:
-        raise ValueError("数据集为空，请确保提供了有效的数据路径")
+    logger.info("加载训练数据集...")
+    try:
+        train_dataset = TripletBucketDataset(json_path=args.train_json_path, 
+                                        buckets=buckets,
+                                        metadata_file=args.train_metadata_file)
+        
+        if len(train_dataset) == 0:
+            logger.error("训练数据集为空，请检查数据路径和文件格式")
+            logger.error(f"检查数据目录结构: {args.train_json_path}")
+            
+            # 检查目录结构
+            train_dir = os.path.dirname(args.train_json_path)
+            logger.info(f"列出目录结构: {train_dir}")
+            subdirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
+            logger.info(f"子目录: {subdirs}")
+            
+            # 检查JSON文件格式
+            with open(args.train_json_path, "r") as f:
+                data = json.load(f)
+                logger.info(f"JSON文件中的字段: {list(data.keys())}")
+                if "mapping" in data:
+                    mapping_count = len(data["mapping"])
+                    logger.info(f"Mapping项数量: {mapping_count}")
+                    if mapping_count > 0:
+                        sample_key = next(iter(data["mapping"].keys()))
+                        logger.info(f"示例映射: {sample_key} -> {data['mapping'][sample_key]}")
+            
+            raise ValueError("训练数据集为空，请检查日志中的路径和文件格式信息")
+    except Exception as e:
+        logger.error(f"加载训练数据集时发生错误: {str(e)}")
+        raise
+        
+    try:
+        val_dataset = TripletBucketDataset(json_path=args.val_json_path, 
+                                        buckets=buckets)
+        logger.info(f"验证集大小: {len(val_dataset)}")
+    except Exception as e:
+        logger.warning(f"加载验证集时发生错误: {str(e)}")
+        val_dataset = None
+    
+    logger.info(f"加载了 {len(train_dataset)} 个训练样本")
+    
+    batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=False)
     
     logger.info(f"加载了 {len(train_dataset)} 个训练样本")
     
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
+        batch_sampler=batch_sampler,
+        collate_fn=triplet_collate_fn,
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
     )
@@ -534,12 +680,14 @@ def main():
                 
                 for i in range(ref.shape[0]):
                     image_tensor = ref[i].cpu()
+                    # 转换为float32，因为numpy不支持BFloat16
+                    image_tensor = image_tensor.to(torch.float32)
                     image_tensor = image_tensor.permute(1, 2, 0)
                     image_numpy = image_tensor.numpy()
                     pil_image = Image.fromarray((image_numpy * 255).astype('uint8'))
                     
                     with torch.no_grad():
-                        prompt_embed, pooled_prompt_embed = image_output(flux_redux, pil_image, device=accelerator.device)
+                        prompt_embed, pooled_prompt_embed = image_output(flux_redux_pipe, pil_image, device=accelerator.device)
                         prompt_embeds.append(prompt_embed.squeeze(1))
                         pooled_prompt_embeds.append(pooled_prompt_embed.squeeze(1))
                 
@@ -619,15 +767,16 @@ def main():
                             logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{completed_steps}')}")
                 
                 if global_step % args.validation_steps == 0:
-                    if accelerator.is_main_process:
-                        logger.info(f"在步骤 {global_step} 运行验证")
-                        
-                        validation_dir = os.path.join(args.output_dir, f"validation-{global_step}")
-                        os.makedirs(validation_dir, exist_ok=True)
-                        
-                        # TODO: 细节优化，实际推理没有已经编辑好的，消除后的图像，只有待消除图像和需要消除的mask区域
-                        log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-                        logger.info(f"验证样本保存到 {validation_dir}")
+                    logger.info("Running validation...")
+                    try:
+                        if val_dataset is not None and len(val_dataset) > 0:
+                            log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                        else:
+                            logger.warning("验证集为空或无效，跳过推理过程")
+                    except Exception as e:
+                        logger.error(f"Inference failed with error: {e}")
+                        traceback.print_exc()
+                        logger.info("尽管推理失败，但训练将继续")
             
             if global_step >= args.max_train_steps:
                 break

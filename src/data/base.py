@@ -1,7 +1,4 @@
-import json
-import cv2
 import numpy as np
-import os
 from torch.utils.data import Dataset
 from PIL import Image, ImageDraw
 import cv2
@@ -13,9 +10,8 @@ import random
 import torchvision.transforms as T
 
 class BaseDataset(Dataset):
-    def __init__(self, size=(768, 768)):
+    def __init__(self):
         self.to_tensor = T.ToTensor()
-        self.size = size
 
     def __len__(self):
         # We adjust the ratio of different dataset by setting the length.
@@ -29,7 +25,6 @@ class BaseDataset(Dataset):
     def get_sample(self, idx):
         # Implemented for each specific dataset
         pass
-    
     
     def process_triplets(self, input_image, removed_mask, removed_image, size=(768, 768)):
         '''
@@ -164,3 +159,9 @@ class BaseDataset(Dataset):
             mask=diptych_mask,      # mask（黑色 + 被擦除物体的mask）
         )
         return item
+    
+    def process_custom(self, input_image, removed_mask, removed_image, size=(768, 768)):
+        '''
+        数据不一定是三元组，或者是三元组，是否使用diptych可以自定义
+        '''
+        pass

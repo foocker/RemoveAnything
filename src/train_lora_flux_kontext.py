@@ -19,10 +19,8 @@ import itertools
 import logging
 import math
 import os
-import random
 import shutil
 import warnings
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -32,15 +30,8 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
-from huggingface_hub.utils import insecure_hashlib
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
-from PIL import Image
-from PIL.ImageOps import exif_transpose
-from torch.utils.data import Dataset
-from torch.utils.data.sampler import BatchSampler
-from torchvision import transforms
-from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 
@@ -58,7 +49,8 @@ from diffusers.training_utils import (
     cast_training_params,
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
-    free_memory
+    free_memory,
+    
 )
 from diffusers.utils import (
     check_min_version,
@@ -69,7 +61,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_torch_npu_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-import re
+from data.bucket_dataset import LazyImageDataset, BucketBatchSampler, collate_fn
 
 
 if is_wandb_available():
@@ -82,46 +74,6 @@ logger = get_logger(__name__)
 
 if is_torch_npu_available():
     torch.npu.config.allow_internal_format = False
-
-
-def find_nearest_bucket(h, w, bucket_options):
-    """Finds the closes bucket to the given height and width."""
-    min_metric = float("inf")
-    best_bucket_idx = None
-    for bucket_idx, (bucket_h, bucket_w) in enumerate(bucket_options):
-        metric = abs(h * bucket_w - w * bucket_h)
-        if metric <= min_metric:
-            min_metric = metric
-            best_bucket_idx = bucket_idx
-    return best_bucket_idx
-
-
-def parse_buckets_string(buckets_str):
-    """Parses a string defining buckets into a list of (height, width) tuples."""
-    if not buckets_str:
-        raise ValueError("Bucket string cannot be empty.")
-
-    bucket_pairs = buckets_str.strip().split(";")
-    parsed_buckets = []
-    for pair_str in bucket_pairs:
-        match = re.match(r"^\s*(\d+)\s*,\s*(\d+)\s*$", pair_str)
-        if not match:
-            raise ValueError(f"Invalid bucket format: '{pair_str}'. Expected 'height,width'.")
-        try:
-            height = int(match.group(1))
-            width = int(match.group(2))
-            if height <= 0 or width <= 0:
-                raise ValueError("Bucket dimensions must be positive integers.")
-            if height % 8 != 0 or width % 8 != 0:
-                warnings.warn(f"Bucket dimension ({height},{width}) not divisible by 8. This might cause issues.")
-            parsed_buckets.append((height, width))
-        except ValueError as e:
-            raise ValueError(f"Invalid integer in bucket pair '{pair_str}': {e}") from e
-
-    if not parsed_buckets:
-        raise ValueError("No valid buckets found in the provided string.")
-
-    return parsed_buckets
 
 
 def save_model_card(
@@ -329,19 +281,24 @@ def parse_args(input_args=None):
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument(
-        "--instance_data_dir",
+        "--data_dir",
         type=str,
         default=None,
-        help=("A folder containing the training data. "),
+        required=True,
+        help="数据目录，包含用于训练的图像文件",
     )
-
     parser.add_argument(
-        "--cache_dir",
+        "--metadata_file",
         type=str,
         default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
+        help="可选的JSON元数据文件，包含图像路径、桶索引和可选的提示词",
     )
-
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="",
+        help="默认提示词，用于所有图像(除非元数据指定自定义提示词)",
+    )
     parser.add_argument(
         "--image_column",
         type=str,
@@ -360,24 +317,11 @@ def parse_args(input_args=None):
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
 
     parser.add_argument(
-        "--class_data_dir",
+        "--prompt",
         type=str,
-        default=None,
-        required=False,
-        help="A folder containing the training data of class images.",
-    )
-    parser.add_argument(
-        "--instance_prompt",
-        type=str,
-        default=None,
+        default="",
         required=True,
-        help="The prompt with identifier specifying the instance, e.g. 'photo of a TOK dog', 'in the style of TOK'",
-    )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
+        help="The default training prompt to use for all images unless custom prompts are provided.",
     )
     parser.add_argument(
         "--max_sequence_length",
@@ -420,22 +364,7 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--lora_dropout", type=float, default=0.0, help="Dropout probability for LoRA layers")
 
-    parser.add_argument(
-        "--with_prior_preservation",
-        default=False,
-        action="store_true",
-        help="Flag to add prior preservation loss.",
-    )
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
-    parser.add_argument(
-        "--num_class_images",
-        type=int,
-        default=100,
-        help=(
-            "Minimal class images for prior preservation loss. If there are not enough images already present in"
-            " class_data_dir, additional images will be sampled with class_prompt."
-        ),
-    )
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -766,258 +695,6 @@ def parse_args(input_args=None):
     return args
 
 
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        instance_prompt,
-        class_prompt,
-        class_data_root=None,
-        class_num=None,
-        repeats=1,
-        center_crop=False,
-        buckets=None,
-    ):
-        self.center_crop = center_crop
-
-        self.instance_prompt = instance_prompt
-        self.custom_instance_prompts = None
-        self.class_prompt = class_prompt
-
-        self.buckets = buckets
-
-        # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
-        # we load the training data using load_dataset
-        if args.dataset_name is not None:
-            try:
-                from datasets import load_dataset
-            except ImportError:
-                raise ImportError(
-                    "You are trying to load your data using the datasets library. If you wish to train using custom "
-                    "captions please install the datasets library: `pip install datasets`. If you wish to load a "
-                    "local folder containing images only, specify --instance_data_dir instead."
-                )
-            # Downloading and loading a dataset from the hub.
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-            dataset = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                cache_dir=args.cache_dir,
-            )
-            # Preprocessing the datasets.
-            column_names = dataset["train"].column_names
-
-            # 6. Get the column names for input/target.
-            if args.image_column is None:
-                image_column = column_names[0]
-                logger.info(f"image column defaulting to {image_column}")
-            else:
-                image_column = args.image_column
-                if image_column not in column_names:
-                    raise ValueError(
-                        f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-            instance_images = dataset["train"][image_column]
-
-            if args.caption_column is None:
-                logger.info(
-                    "No caption column provided, defaulting to instance_prompt for all images. If your dataset "
-                    "contains captions/prompts for the images, make sure to specify the "
-                    "column as --caption_column"
-                )
-                self.custom_instance_prompts = None
-            else:
-                if args.caption_column not in column_names:
-                    raise ValueError(
-                        f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-                custom_instance_prompts = dataset["train"][args.caption_column]
-                # create final list of captions according to --repeats
-                self.custom_instance_prompts = []
-                for caption in custom_instance_prompts:
-                    self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
-        else:
-            self.instance_data_root = Path(instance_data_root)
-            if not self.instance_data_root.exists():
-                raise ValueError("Instance images root doesn't exists.")
-
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-            self.custom_instance_prompts = None
-
-        self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
-
-        self.pixel_values = []
-        for image in self.instance_images:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-
-            width, height = image.size
-
-            # Find the closest bucket
-            bucket_idx = find_nearest_bucket(height, width, self.buckets)
-            target_height, target_width = self.buckets[bucket_idx]
-            self.size = (target_height, target_width)
-
-            # based on the bucket assignment, define the transformations
-            train_resize = transforms.Resize(self.size, interpolation=transforms.InterpolationMode.BILINEAR)
-            train_crop = transforms.CenterCrop(self.size) if center_crop else transforms.RandomCrop(self.size)
-            train_flip = transforms.RandomHorizontalFlip(p=1.0)
-            train_transforms = transforms.Compose(
-                [
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5], [0.5]),
-                ]
-            )
-            image = train_resize(image)
-            if args.center_crop:
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, self.size)
-                image = crop(image, y1, x1, h, w)
-            if args.random_flip and random.random() < 0.5:
-                image = train_flip(image)
-            image = train_transforms(image)
-            self.pixel_values.append((image, bucket_idx))
-
-        self.num_instance_images = len(self.instance_images)
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            if class_num is not None:
-                self.num_class_images = min(len(self.class_images_path), class_num)
-            else:
-                self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-        else:
-            self.class_data_root = None
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(self.size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(self.size) if center_crop else transforms.RandomCrop(self.size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        instance_image, bucket_idx = self.pixel_values[index % self.num_instance_images]
-        example["instance_images"] = instance_image
-        example["bucket_idx"] = bucket_idx
-
-        if self.custom_instance_prompts:
-            caption = self.custom_instance_prompts[index % self.num_instance_images]
-            if caption:
-                example["instance_prompt"] = caption
-            else:
-                example["instance_prompt"] = self.instance_prompt
-
-        else:  # custom prompts were provided, but length does not match size of image dataset
-            example["instance_prompt"] = self.instance_prompt
-
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt"] = self.class_prompt
-
-        return example
-
-
-def collate_fn(examples, with_prior_preservation=False):
-    pixel_values = [example["instance_images"] for example in examples]
-    prompts = [example["instance_prompt"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        pixel_values += [example["class_images"] for example in examples]
-        prompts += [example["class_prompt"] for example in examples]
-
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
-    return batch
-
-
-class BucketBatchSampler(BatchSampler):
-    def __init__(self, dataset: DreamBoothDataset, batch_size: int, drop_last: bool = False):
-        if not isinstance(batch_size, int) or batch_size <= 0:
-            raise ValueError("batch_size should be a positive integer value, but got batch_size={}".format(batch_size))
-        if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value, but got drop_last={}".format(drop_last))
-
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-
-        # Group indices by bucket
-        self.bucket_indices = [[] for _ in range(len(self.dataset.buckets))]
-        for idx, (_, bucket_idx) in enumerate(self.dataset.pixel_values):
-            self.bucket_indices[bucket_idx].append(idx)
-
-        self.sampler_len = 0
-        self.batches = []
-
-        # Pre-generate batches for each bucket
-        for indices_in_bucket in self.bucket_indices:
-            # Shuffle indices within the bucket
-            random.shuffle(indices_in_bucket)
-            # Create batches
-            for i in range(0, len(indices_in_bucket), self.batch_size):
-                batch = indices_in_bucket[i : i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue  # Skip partial batch if drop_last is True
-                self.batches.append(batch)
-                self.sampler_len += 1  # Count the number of batches
-
-    def __iter__(self):
-        # Shuffle the order of the batches each epoch
-        random.shuffle(self.batches)
-        for batch in self.batches:
-            yield batch
-
-    def __len__(self):
-        return self.sampler_len
-
-
-class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
-
-    def __init__(self, prompt, num_samples):
-        self.prompt = prompt
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt
-        example["index"] = index
-        return example
-
-
 def tokenize_prompt(tokenizer, prompt, max_sequence_length):
     text_inputs = tokenizer(
         prompt,
@@ -1211,61 +888,7 @@ def main(args):
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Generate class images if prior preservation is enabled.
-    if args.with_prior_preservation:
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
-
-        if cur_class_images < args.num_class_images:
-            has_supported_fp16_accelerator = torch.cuda.is_available() or torch.backends.mps.is_available()
-            torch_dtype = torch.float16 if has_supported_fp16_accelerator else torch.float32
-            if args.prior_generation_precision == "fp32":
-                torch_dtype = torch.float32
-            elif args.prior_generation_precision == "fp16":
-                torch_dtype = torch.float16
-            elif args.prior_generation_precision == "bf16":
-                torch_dtype = torch.bfloat16
-
-            transformer = FluxTransformer2DModel.from_pretrained(
-                args.pretrained_model_name_or_path,
-                subfolder="transformer",
-                revision=args.revision,
-                variant=args.variant,
-            )
-            pipeline = FluxKontextPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                transformer=transformer,
-                torch_dtype=torch_dtype,
-                revision=args.revision,
-                variant=args.variant,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
-
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
-
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
-
-            del pipeline
-            free_memory()
-
-    # Handle the repository creation
+    
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1557,29 +1180,34 @@ def main(args):
             use_bias_correction=args.prodigy_use_bias_correction,
             safeguard_warmup=args.prodigy_safeguard_warmup,
         )
-
-    if args.aspect_ratio_buckets is not None:
-        buckets = parse_buckets_string(args.aspect_ratio_buckets)
-    else:
-        buckets = [(args.resolution, args.resolution)]
-    logger.info(f"Using parsed aspect ratio buckets: {buckets}")
-
-    # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_prompt=args.class_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_num=args.num_class_images,
-        buckets=buckets,
-        repeats=args.repeats,
+    
+    # 检查输入数据目录
+    data_dir = Path(args.data_dir)
+    if not data_dir.exists():
+        raise ValueError(f"数据目录不存在: {data_dir}")
+    
+    logger.info(f"使用数据目录: {data_dir}")
+    logger.info(f"默认提示词: {args.prompt}")
+    # 创建数据加载器
+    train_dataset = LazyImageDataset(
+        data_root=args.train_data_dir,
+        prompt=args.train_prompt,
+        buckets=args.buckets,
         center_crop=args.center_crop,
+        random_flip=args.random_flip,
+        metadata_file=args.metadata_file
     )
-    batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=False)
+    
+    bucket_batch_sampler = BucketBatchSampler(
+        train_dataset, 
+        batch_size=args.train_batch_size,
+        bucket_ids=train_dataset.bucket_ids
+    )
+    
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_sampler=batch_sampler,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        batch_sampler=bucket_batch_sampler,
+        collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -1597,53 +1225,23 @@ def main(args):
                 text_ids = text_ids.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds, text_ids
 
-    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
-    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
-    # the redundant encoding.
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
-        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
-            args.instance_prompt, text_encoders, tokenizers
+    # 对于懒加载数据集，如果没有自定义提示词，只需要预计算默认提示词的编码
+    if not args.train_text_encoder:
+        # 预处理默认提示词
+        logger.info(f"预计算提示词编码: {args.prompt}")
+        prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
+            args.prompt, text_encoders, tokenizers
         )
-
-    # Handle class prompt for prior-preservation.
-    if args.with_prior_preservation:
-        if not args.train_text_encoder:
-            class_prompt_hidden_states, class_pooled_prompt_embeds, class_text_ids = compute_text_embeddings(
-                args.class_prompt, text_encoders, tokenizers
-            )
-
-    # Clear the memory here
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
+        
+        # 释放内存
         del text_encoder_one, text_encoder_two, tokenizer_one, tokenizer_two
         free_memory()
-
-    # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
-    # pack the statically computed variables appropriately here. This is so that we don't
-    # have to pass them to the dataloader.
-
-    if not train_dataset.custom_instance_prompts:
-        if not args.train_text_encoder:
-            prompt_embeds = instance_prompt_hidden_states
-            pooled_prompt_embeds = instance_pooled_prompt_embeds
-            text_ids = instance_text_ids
-            if args.with_prior_preservation:
-                prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
-                pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, class_pooled_prompt_embeds], dim=0)
-                text_ids = torch.cat([text_ids, class_text_ids], dim=0)
-        # if we're optimizing the text encoder (both if instance prompt is used for all images or custom prompts)
-        # we need to tokenize and encode the batch prompts on all training steps
-        else:
-            tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt, max_sequence_length=77)
-            tokens_two = tokenize_prompt(
-                tokenizer_two, args.instance_prompt, max_sequence_length=args.max_sequence_length
-            )
-            if args.with_prior_preservation:
-                class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt, max_sequence_length=77)
-                class_tokens_two = tokenize_prompt(
-                    tokenizer_two, args.class_prompt, max_sequence_length=args.max_sequence_length
-                )
-                tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
-                tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
+    else:
+        # 如果需要训练文本编码器，预处理默认token
+        tokens_one = tokenize_prompt(tokenizer_one, args.prompt, max_sequence_length=77)
+        tokens_two = tokenize_prompt(
+            tokenizer_two, args.prompt, max_sequence_length=args.max_sequence_length
+        )
 
     vae_config_shift_factor = vae.config.shift_factor
     vae_config_scaling_factor = vae.config.scaling_factor
@@ -1786,51 +1384,65 @@ def main(args):
         transformer.train()
         if args.train_text_encoder:
             text_encoder_one.train()
-            # set top parameter requires_grad = True for gradient checkpointing works
+            # 设置顶层参数requires_grad = True以使梯度检查点生效
             unwrap_model(text_encoder_one).text_model.embeddings.requires_grad_(True)
 
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
             if args.train_text_encoder:
                 models_to_accumulate.extend([text_encoder_one])
+                
             with accelerator.accumulate(models_to_accumulate):
-                prompts = batch["prompts"]
-
-                # encode batch prompts when custom prompts are provided for each image -
-                if train_dataset.custom_instance_prompts:
-                    if not args.train_text_encoder:
-                        prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
-                            prompts, text_encoders, tokenizers
-                        )
-                    else:
-                        tokens_one = tokenize_prompt(tokenizer_one, prompts, max_sequence_length=77)
-                        tokens_two = tokenize_prompt(
-                            tokenizer_two, prompts, max_sequence_length=args.max_sequence_length
-                        )
+                # 根据数据集处理提示词
+                # 如果在批次中有自定义提示词，使用它们
+                if "prompt_ids" in batch:
+                    # 批次包含自定义提示词
+                    if args.train_text_encoder:
+                        # 在训练文本编码器时，使用批次中的提示词ID
                         prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                             text_encoders=[text_encoder_one, text_encoder_two],
                             tokenizers=[None, None],
-                            text_input_ids_list=[tokens_one, tokens_two],
+                            text_input_ids_list=[batch["prompt_ids"], batch["prompt_ids"]],
                             max_sequence_length=args.max_sequence_length,
                             device=accelerator.device,
-                            prompt=prompts,
+                            prompt=args.prompt,
                         )
+                    else:
+                        # 不训练文本编码器时，使用批次中的提示词嵌入
+                        if "prompt_embeds" in batch:
+                            prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
+                            pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
+                            text_ids = batch["text_ids"].to(accelerator.device)
+                        else:
+                            # 需要先计算提示词嵌入
+                            custom_prompts = batch["prompts"]
+                            prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
+                                custom_prompts, text_encoders, tokenizers
+                            )
                 else:
-                    elems_to_repeat = len(prompts)
+                    # 使用预先计算好的默认提示词嵌入
+                    batch_size = batch["pixel_values"].shape[0]
+                    
                     if args.train_text_encoder:
+                        # 训练文本编码器时重复默认token
                         prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                             text_encoders=[text_encoder_one, text_encoder_two],
                             tokenizers=[None, None],
                             text_input_ids_list=[
-                                tokens_one.repeat(elems_to_repeat, 1),
-                                tokens_two.repeat(elems_to_repeat, 1),
+                                tokens_one.repeat(batch_size, 1),
+                                tokens_two.repeat(batch_size, 1),
                             ],
                             max_sequence_length=args.max_sequence_length,
                             device=accelerator.device,
-                            prompt=args.instance_prompt,
+                            prompt=args.prompt,
                         )
+                    else:
+                        # 不训练文本编码器时，重复预计算的嵌入
+                        prompt_embeds = prompt_embeds.repeat(batch_size, 1, 1)
+                        pooled_prompt_embeds = pooled_prompt_embeds.repeat(batch_size, 1)
+                        text_ids = text_ids.repeat(batch_size, 1)
 
-                # Convert images to latent space
+                # 将图像转换到潜在空间
                 if args.cache_latents:
                     if args.vae_encode_mode == "sample":
                         model_input = latents_cache[step].sample()
@@ -1842,6 +1454,7 @@ def main(args):
                         model_input = vae.encode(pixel_values).latent_dist.sample()
                     else:
                         model_input = vae.encode(pixel_values).latent_dist.mode()
+                        
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
@@ -1916,30 +1529,12 @@ def main(args):
                 # flow matching loss
                 target = noise - model_input
 
-                if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                    target, target_prior = torch.chunk(target, 2, dim=0)
-
-                    # Compute prior loss
-                    prior_loss = torch.mean(
-                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
-                            target_prior.shape[0], -1
-                        ),
-                        1,
-                    )
-                    prior_loss = prior_loss.mean()
-
                 # Compute regular loss.
                 loss = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     1,
                 )
                 loss = loss.mean()
-
-                if args.with_prior_preservation:
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

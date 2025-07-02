@@ -23,39 +23,91 @@ def load_triplet_paths(json_path):
     
     root_path = os.path.dirname(json_path)
     triplet_paths = []
+    invalid_paths = []
+    processed_count = 0
+    
+    # 检查目录是否存在
+    gt_dir = os.path.join(root_path, "gt")
+    input_dir = os.path.join(root_path, "input")
+    mask_dir = os.path.join(root_path, "mask")
+    
+    print(f"数据路径检查: \n - gt目录: {'存在' if os.path.isdir(gt_dir) else '不存在！'} ({gt_dir}) \n - input目录: {'存在' if os.path.isdir(input_dir) else '不存在！'} ({input_dir}) \n - mask目录: {'存在' if os.path.isdir(mask_dir) else '不存在！'} ({mask_dir})")
     
     if use_ijson:
         with open(json_path, 'rb') as f:
             # 流式解析mapping部分
             for gt_image, mask_input_files in ijson.kvitems(f, 'mapping'):
+                processed_count += 1
                 gt_path = os.path.join(root_path, "gt", os.path.basename(gt_image))
                 
+                if not os.path.exists(gt_path):
+                    invalid_paths.append(f"GT图像不存在: {gt_path}")
+                    continue
+                    
                 for mask_input_file in mask_input_files:
                     input_path = os.path.join(root_path, "input", os.path.basename(mask_input_file))
                     mask_path = os.path.join(root_path, "mask", os.path.basename(mask_input_file))
                     
+                    # 验证路径是否存在
+                    all_valid = True
+                    if not os.path.exists(input_path):
+                        invalid_paths.append(f"输入图像不存在: {input_path}")
+                        all_valid = False
+                    if not os.path.exists(mask_path):
+                        invalid_paths.append(f"掩码图像不存在: {mask_path}")
+                        all_valid = False
+                        
+                    if all_valid:
+                        triplet_paths.append({
+                            "input_image": input_path,
+                            "edited_image": gt_path,
+                            "mask": mask_path
+                        })
+    else:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+            if "mapping" not in data:
+                print(f"错误: JSON文件 {json_path} 中没有'mapping'字段。文件包含以下字段: {list(data.keys())}")
+                return []
+                
+            mapping_data = data["mapping"]
+            processed_count = len(mapping_data)
+        
+        for gt_image, mask_input_files in mapping_data.items():
+            gt_path = os.path.join(root_path, "gt", os.path.basename(gt_image))
+            
+            if not os.path.exists(gt_path):
+                invalid_paths.append(f"GT图像不存在: {gt_path}")
+                continue
+                
+            for mask_input_file in mask_input_files:
+                input_path = os.path.join(root_path, "input", os.path.basename(mask_input_file))
+                mask_path = os.path.join(root_path, "mask", os.path.basename(mask_input_file))
+                
+                # 验证路径是否存在
+                all_valid = True
+                if not os.path.exists(input_path):
+                    invalid_paths.append(f"输入图像不存在: {input_path}")
+                    all_valid = False
+                if not os.path.exists(mask_path):
+                    invalid_paths.append(f"掩码图像不存在: {mask_path}")
+                    all_valid = False
+                    
+                if all_valid:
                     triplet_paths.append({
                         "input_image": input_path,
                         "edited_image": gt_path,
                         "mask": mask_path
                     })
-    else:
-        with open(json_path, "r") as f:
-            data = json.load(f)
-            mapping_data = data["mapping"]
-        
-        for gt_image, mask_input_files in mapping_data.items():
-            gt_path = os.path.join(root_path, "gt", os.path.basename(gt_image))
-            
-            for mask_input_file in mask_input_files:
-                input_path = os.path.join(root_path, "input", os.path.basename(mask_input_file))
-                mask_path = os.path.join(root_path, "mask", os.path.basename(mask_input_file))
-                
-                triplet_paths.append({
-                    "input_image": input_path,
-                    "edited_image": gt_path,
-                    "mask": mask_path
-                })
+    
+    # 打印统计信息
+    print(f"处理了 {processed_count} 条映射项，找到 {len(triplet_paths)} 条有效的三元组路径")
+    if invalid_paths:
+        print(f"发现 {len(invalid_paths)} 条无效路径:")
+        for i, path in enumerate(invalid_paths[:10]):  # 只打印前10个错误
+            print(f" - {path}")
+        if len(invalid_paths) > 10:
+            print(f" - ...以及其他 {len(invalid_paths)-10} 条错误（已省略）")
     
     return triplet_paths
 
