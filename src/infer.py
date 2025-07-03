@@ -1,191 +1,275 @@
+#!/usr/bin/env python
+# coding=utf-8
+"""
+RemoveAnything LoRA 权重推理脚本
+用于加载训练好的 LoRA 权重进行物体移除推理
+"""
+
 from PIL import Image
 import torch
 import os
 import numpy as np
 import cv2
-from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
-from data.data_utils import get_bbox_from_mask, expand_bbox, pad_to_square, box2squre, crop_back, expand_image_mask
 import time
 import argparse
+import logging
+from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
+from data.data_utils import get_bbox_from_mask, expand_bbox, pad_to_square, box2squre, crop_back, expand_image_mask
+
+# 设置日志记录
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def set_seed(seed):
+    """设置随机种子以确保结果可复现"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RemoveAnything inference script")
+    parser = argparse.ArgumentParser(description="RemoveAnything LoRA 权重推理脚本")
     
-    # Model paths
+    # 模型路径
     parser.add_argument("--flux_fill_path", type=str, 
-                        default="",
-                        help="Path to FLUX Fill model")
+                        required=True,
+                        help="FluxFill模型的路径")
     parser.add_argument("--lora_weights_path", type=str, 
-                        default="",
-                        help="Path to LoRA weights")
+                        required=True,
+                        help="LoRA权重路径")
     parser.add_argument("--flux_redux_path", type=str, 
-                        default="",
-                        help="Path to FLUX Redux model")
+                        required=True,
+                        help="FluxRedux模型路径")
     
-    # Image and mask paths
+    # 图像和蒙版路径
     parser.add_argument("--source_image", type=str, 
-                        default="examples/source_image/xx.png",
-                        help="Path to source image")
+                        required=True,
+                        help="源图像路径")
     parser.add_argument("--source_mask", type=str, 
-                        default="examples/source_mask/xx_mask.png",
-                        help="Path to source mask")
+                        required=True,
+                        help="源蒙版路径")
+    parser.add_argument("--ref_image", type=str, 
+                        help="参考图像路径，默认与源图像相同", default=None)
+    parser.add_argument("--ref_mask", type=str, 
+                        help="参考蒙版路径，默认与源蒙版相同", default=None)
     
-    # Output path
+    # 输出路径
     parser.add_argument("--output_dir", type=str, 
-                        default="./results",
-                        help="Directory to save results")
+                        default="./output",
+                        help="结果保存目录")
     
-    # Inference parameters
-    parser.add_argument("--seed", type=int, default=666, help="Random seed for generation")
+    # 推理参数
+    parser.add_argument("--seed", type=int, default=666, help="随机种子")
     parser.add_argument("--size", type=int, default=768, 
                         choices=[512, 768, 1024],
-                        help="Image size for processing")
+                        help="处理图像的大小")
     parser.add_argument("--num_inference_steps", type=int, default=30,
-                        help="Number of inference steps")
+                        help="推理步数")
     parser.add_argument("--repeat", type=int, default=1,
-                        help="Number of times to repeat inference")
+                        help="推理重复次数")
+    parser.add_argument("--expansion_ratio", type=float, default=2.0,
+                        help="遮罩扩展比例，值越大裁剪区域越大")
     
     return parser.parse_args()
 
-args = parse_args()
-
-device = torch.device(f"cuda")
-dtype = torch.bfloat16
-size = (args.size, args.size)
-
-# Load the pre-trained model and LoRA weights from command line arguments
-pipe = FluxFillPipeline.from_pretrained(
-    args.flux_fill_path,
-    torch_dtype=dtype,
-    use_safetensors=True
-).to(dtype=dtype)
-
-# Force disable xformers
-if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
-    pipe._use_memory_efficient_attention_xformers = False
-
-pipe.load_lora_weights(
-    args.lora_weights_path
-).to(dtype=dtype)
-
-redux = FluxPriorReduxPipeline.from_pretrained(
-    args.flux_redux_path
-).to(dtype=dtype)
-
-# If you want to reduce GPU memory usage, please comment out the following two lines and uncomment the next three lines.
-pipe.to(device)
-redux.to(device)
-
-# The purpose of this code is to reduce the GPU memory usage to 26GB, but it will increase the inference time accordingly.
-# pipe.enable_model_cpu_offload()
-# pipe.enable_vae_slicing()
-# redux.enable_model_cpu_offload()
-
-
-# Load the source and reference images and masks from command line arguments
-source_image_path = args.source_image
-mask_image_path = args.source_mask
-
-# Load the images and masks
-ref_image = cv2.imread(source_image_path)
-ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
-tar_image = cv2.imread(source_image_path)
-tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
-ref_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
-tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
-tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
-
-# Remove the background information of the reference picture
-ref_box_yyxx = get_bbox_from_mask(ref_mask)
-ref_mask_3 = np.stack([ref_mask,ref_mask,ref_mask],-1)
-masked_ref_image = ref_image * ref_mask_3 + np.ones_like(ref_image) * 255 * (1-ref_mask_3) 
-
-# Extract the box where the reference image is located, and place the reference object at the center of the image
-y1,y2,x1,x2 = ref_box_yyxx
-masked_ref_image = masked_ref_image[y1:y2,x1:x2,:] 
-ref_mask = ref_mask[y1:y2,x1:x2] 
-ratio = 1.3
-masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio) 
-masked_ref_image = pad_to_square(masked_ref_image, pad_value = 255, random = False)
-
-# Dilate the mask
-kernel = np.ones((7, 7), np.uint8)
-iterations = 2
-tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
-
-# zome in
-tar_box_yyxx = get_bbox_from_mask(tar_mask)
-tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=1.2)
-
-tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=2)   
-tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop)
-y1,y2,x1,x2 = tar_box_yyxx_crop
-
-old_tar_image = tar_image.copy()
-tar_image = tar_image[y1:y2,x1:x2,:]
-tar_mask = tar_mask[y1:y2,x1:x2]
-
-H1, W1 = tar_image.shape[0], tar_image.shape[1]
-
-tar_mask = pad_to_square(tar_mask, pad_value=0)
-tar_mask = cv2.resize(tar_mask, size)
-
-# Extract the features of the reference image
-masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
-pipe_prior_output = redux(Image.fromarray(masked_ref_image))
-
-tar_image = pad_to_square(tar_image, pad_value=255)
-H2, W2 = tar_image.shape[0], tar_image.shape[1]
-
-tar_image = cv2.resize(tar_image, size)
-diptych_ref_tar = np.concatenate([masked_ref_image, tar_image], axis=1)
-
-tar_mask = np.stack([tar_mask,tar_mask,tar_mask],-1)
-mask_black = np.ones_like(tar_image) * 0
-mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
-
-diptych_ref_tar = Image.fromarray(diptych_ref_tar)
-mask_diptych[mask_diptych == 1] = 255
-mask_diptych = Image.fromarray(mask_diptych)
-
-seeds = [args.seed]
-repeat = args.repeat
-num_inference_steps = args.num_inference_steps  # 1024-> 20:55s, 30:83s, 50:137s; 768-> 10:14s ,20:28s, 30:43s, 50:71s
-for seed in seeds:
-    generator = torch.Generator(device).manual_seed(seed)
-    for i in range(repeat):
-        start = time.time()
-        edited_image = pipe(
-            image=diptych_ref_tar,
-            mask_image=mask_diptych,
-            height=mask_diptych.size[1],
-            width=mask_diptych.size[0],
-            max_sequence_length=512,
-            generator=generator,
-            num_inference_steps=num_inference_steps,
-            **pipe_prior_output,
-        ).images[0]
-        end = time.time()
-        print(f"Inference time: {end - start} seconds")
-
-    width, height = edited_image.size
-    left = width // 2
-    right = width
-    top = 0
-    bottom = height
-    edited_image = edited_image.crop((left, top, right, bottom))
-
-    edited_image = np.array(edited_image)
-    edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
-    edited_image = Image.fromarray(edited_image)
-
-    # Get the filenames without paths and extensions for saving results
-    source_with_ext = os.path.basename(source_image_path)
-    tar_with_ext = os.path.basename(mask_image_path)
-    source_without_ext = os.path.splitext(source_with_ext)[0]
-    tar_without_ext = os.path.splitext(tar_with_ext)[0]
+def main():
+    args = parse_args()
     
-    save_path = args.output_dir
-    os.makedirs(save_path, exist_ok=True)
-    edited_image_save_path = os.path.join(save_path, f"{source_without_ext}_to_{tar_without_ext}_seed{seed}_{num_inference_steps}_{size[0]}.png")
-    edited_image.save(edited_image_save_path)
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 设置设备和数据类型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
+    logger.info(f"使用设备: {device}, 数据类型: {dtype}")
+    
+    # 加载预训练模型
+    logger.info("加载 FluxFill 模型...")
+    pipe = FluxFillPipeline.from_pretrained(
+        args.flux_fill_path,
+        torch_dtype=dtype,
+        use_safetensors=True
+    )
+    
+    # 禁用 xformers 以确保兼容性
+    if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+        pipe._use_memory_efficient_attention_xformers = False
+        logger.info("已禁用 xformers 内存优化")
+    
+    # 加载 LoRA 权重
+    logger.info(f"加载 LoRA 权重: {args.lora_weights_path}")
+    try:
+        pipe.load_lora_weights(args.lora_weights_path)
+        logger.info("成功加载 LoRA 权重")
+    except Exception as e:
+        logger.error(f"加载 LoRA 权重出错: {str(e)}")
+        return
+    
+    # 加载 FluxPriorRedux 模型
+    logger.info("加载 FluxPriorRedux 模型...")
+    redux = FluxPriorReduxPipeline.from_pretrained(
+        args.flux_redux_path,
+        torch_dtype=dtype,
+    )
+    
+    # 将模型移至GPU
+    pipe.to(device=device, dtype=dtype)
+    redux.to(device=device, dtype=dtype)
+    logger.info("模型已加载到设备")
+    
+    # 设置随机种子
+    set_seed(args.seed)
+    
+    # 加载源图像和蒙版
+    logger.info("加载图像和蒙版...")
+    source_image_path = args.source_image
+    mask_image_path = args.source_mask
+    
+    # 设置参考图像，如果没有提供则使用源图像
+    ref_image_path = args.ref_image if args.ref_image else source_image_path
+    ref_mask_path = args.ref_mask if args.ref_mask else mask_image_path
+    
+    # 加载图像和蒙版
+    ref_image = cv2.imread(ref_image_path)
+    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+    tar_image = cv2.imread(source_image_path)
+    tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
+    ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
+    tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
+    
+    # 确保蒙版和图像尺寸匹配
+    if tar_mask.shape[:2] != (tar_image.shape[0], tar_image.shape[1]):
+        logger.info("调整蒙版尺寸以匹配图像")
+        tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
+
+    # 处理参考图像
+    logger.info("处理参考图像...")
+    ref_box_yyxx = get_bbox_from_mask(ref_mask)
+    ref_mask_3 = np.stack([ref_mask, ref_mask, ref_mask], -1)
+    masked_ref_image = ref_image * ref_mask_3 + np.ones_like(ref_image) * 255 * (1-ref_mask_3) 
+    
+    # 提取参考图像中对象的区域
+    y1, y2, x1, x2 = ref_box_yyxx
+    masked_ref_image = masked_ref_image[y1:y2, x1:x2, :] 
+    ref_mask = ref_mask[y1:y2, x1:x2] 
+    
+    # 扩展参考图像，与 infer.py 保持一致使用 1.3 的比例
+    ratio = 1.3
+    masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio) 
+    masked_ref_image = pad_to_square(masked_ref_image, pad_value=255, random=False)
+    
+    # 扩展目标蒙版，与 infer.py 保持一致
+    kernel = np.ones((7, 7), np.uint8)
+    iterations = 2
+    tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
+    
+    # 处理目标图像
+    logger.info("处理目标图像...")
+    # 获取目标边界框，与 infer.py 保持一致
+    tar_box_yyxx = get_bbox_from_mask(tar_mask)
+    # 先扩展蒙版区域
+    tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=1.2)
+    # 再扩展到更大的裁剪区域，infer.py 中固定使用 ratio=2
+    tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=2.0)   
+    tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop)
+    y1, y2, x1, x2 = tar_box_yyxx_crop
+    
+    # 保存原始图像用于后处理
+    old_tar_image = tar_image.copy()
+    tar_image = tar_image[y1:y2, x1:x2, :]
+    tar_mask = tar_mask[y1:y2, x1:x2]
+    
+    # 记录尺寸信息用于后处理
+    H1, W1 = tar_image.shape[0], tar_image.shape[1]
+    
+    # 调整目标蒙版尺寸
+    tar_mask = pad_to_square(tar_mask, pad_value=0)
+    size = (args.size, args.size)
+    tar_mask = cv2.resize(tar_mask, size)
+    
+    # 提取参考图像特征
+    logger.info("提取参考图像特征...")
+    masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
+    
+    # 获取先验输出
+    with torch.no_grad():
+        pipe_prior_output = redux(Image.fromarray(masked_ref_image))
+    
+    # 确保所有张量类型一致
+    for key, value in pipe_prior_output.items():
+        if isinstance(value, torch.Tensor):
+            pipe_prior_output[key] = value.to(device=device, dtype=dtype)
+    
+    # 调整目标图像尺寸
+    tar_image = pad_to_square(tar_image, pad_value=255)
+    H2, W2 = tar_image.shape[0], tar_image.shape[1]
+    tar_image = cv2.resize(tar_image, size)
+    
+    # 创建双图像和蒙版
+    diptych_ref_tar = np.concatenate([masked_ref_image, tar_image], axis=1)
+    tar_mask = np.stack([tar_mask, tar_mask, tar_mask], -1)
+    mask_black = np.ones_like(tar_image) * 0
+    mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
+    
+    diptych_ref_tar = Image.fromarray(diptych_ref_tar)
+    mask_diptych[mask_diptych == 1] = 255
+    mask_diptych = Image.fromarray(mask_diptych)
+    
+    # 显示处理过程
+    logger.info("准备推理...")
+    
+    # 推理
+    seeds = [args.seed]
+    repeat = args.repeat
+    num_inference_steps = args.num_inference_steps
+    
+    for seed_idx, seed in enumerate(seeds):
+        logger.info(f"使用种子 {seed} 进行推理 ({seed_idx + 1}/{len(seeds)})")
+        generator = torch.Generator(device).manual_seed(seed)
+        
+        for i in range(repeat):
+            logger.info(f"推理 {i + 1}/{repeat}")
+            start_time = time.time()
+            
+            # 执行推理
+            edited_image = pipe(
+                image=diptych_ref_tar,
+                mask_image=mask_diptych,
+                height=mask_diptych.size[1],
+                width=mask_diptych.size[0],
+                max_sequence_length=512,
+                generator=generator,
+                num_inference_steps=num_inference_steps,
+                **pipe_prior_output,
+            ).images[0]
+            
+            end_time = time.time()
+            logger.info(f"推理耗时: {end_time - start_time:.2f} 秒")
+            
+            # 裁剪结果
+            width, height = edited_image.size
+            left = width // 2
+            right = width
+            top = 0
+            bottom = height
+            edited_image = edited_image.crop((left, top, right, bottom))
+            
+            # 将结果放回原始图像
+            edited_image = np.array(edited_image)
+            edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
+            edited_image = Image.fromarray(edited_image)
+            
+            # 保存结果
+            source_filename = os.path.splitext(os.path.basename(source_image_path))[0]
+            mask_filename = os.path.splitext(os.path.basename(mask_image_path))[0]
+            output_filename = f"{source_filename}_mask_{mask_filename}_seed{seed}_steps{num_inference_steps}_size{args.size}_repeat{i}.png"
+            output_path = os.path.join(args.output_dir, output_filename)
+            edited_image.save(output_path)
+            logger.info(f"结果已保存到: {output_path}")
+    
+    logger.info("推理完成!")
+    
+    # 清理显存
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    main()

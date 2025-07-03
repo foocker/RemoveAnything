@@ -8,7 +8,6 @@ import logging
 import math
 import time
 import gc
-import traceback
 import numpy as np
 import torch
 import torch.utils.checkpoint
@@ -49,7 +48,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def log_infer(accelerator, args, save_path, epoch, global_step, 
-              pipefill: "FluxFillPipeline", pipeprior: "FluxPriorReduxPipeline"):
+              pipefill: FluxFillPipeline, pipeprior: FluxPriorReduxPipeline):
     # 设置所有模型组件都使用BFloat16
     model_dtype = torch.bfloat16
     logger.info(f"Setting all model components to use {model_dtype}")
@@ -59,54 +58,50 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         # 保存原始方法
         original_decode = pipefill.vae._decode
         
-        # 创建一个引用模型的辅助类，而不是使用闭包函数
-        class DecoderPatch:
-            def __init__(self, pipe, orig_decode, dtype):
-                self.pipe = pipe
-                self.original_decode = orig_decode
-                self.dtype = dtype
+        def patched_decode(z):
+            # 确保所有输入和模型参数都使用相同类型
+            z = z.to(dtype=model_dtype)
+            # 临时将所有decoder组件转换为一致类型
+            with torch.no_grad():
+                for name, module in pipefill.vae.decoder.named_modules():
+                    if hasattr(module, "weight") and module.weight is not None:
+                        if module.weight.dtype != model_dtype:
+                            module.weight.data = module.weight.data.to(model_dtype)
+                    if hasattr(module, "bias") and module.bias is not None:
+                        if module.bias.dtype != model_dtype:
+                            module.bias.data = module.bias.data.to(model_dtype)
                 
-            def __call__(self, z):
-                # 确保所有输入和模型参数都使用相同类型
-                z = z.to(dtype=self.dtype)
-                # 临时将所有decoder组件转换为一致类型
-                with torch.no_grad():
-                    for name, module in self.pipe.vae.decoder.named_modules():
-                        if hasattr(module, "weight") and module.weight is not None:
-                            if module.weight.dtype != self.dtype:
-                                module.weight.data = module.weight.data.to(self.dtype)
-                        if hasattr(module, "bias") and module.bias is not None:
-                            if module.bias.dtype != self.dtype:
-                                module.bias.data = module.bias.data.to(self.dtype)
-                    
-                    # 调用原始方法
-                    try:
-                        return self.original_decode(z)
-                    except Exception as e:
-                        logger.warning(f"Error in patched decode: {e}")
-                        # 如果失败，尝试使用float32
-                        logger.info("Falling back to float32 for this operation")
-                        z_float = z.to(dtype=torch.float32)
-                        # 将decoder暂时转换为float32
-                        self.pipe.vae.decoder = self.pipe.vae.decoder.to(dtype=torch.float32)
-                        result = self.original_decode(z_float)
-                        # 还原为原始类型
-                        self.pipe.vae.decoder = self.pipe.vae.decoder.to(dtype=self.dtype)
-                        return result
+                # 调用原始方法
+                try:
+                    return original_decode(z)
+                except Exception as e:
+                    logger.warning(f"Error in patched decode: {e}")
+                    # 如果失败，尝试使用float32
+                    logger.info("Falling back to float32 for this operation")
+                    z_float = z.to(dtype=torch.float32)
+                    # 将decoder暂时转换为float32
+                    pipefill.vae.decoder = pipefill.vae.decoder.to(dtype=torch.float32)
+                    result = original_decode(z_float)
+                    # 还原为原始类型
+                    pipefill.vae.decoder = pipefill.vae.decoder.to(dtype=model_dtype)
+                    return result
         
         # 替换方法
-        pipefill.vae._decode = DecoderPatch(pipefill, original_decode, model_dtype)
+        pipefill.vae._decode = patched_decode
         logger.info("Successfully patched VAE decoder method")
     
     # 将所有模型转换为BFloat16
     pipefill.to(dtype=model_dtype)
     pipeprior.to(dtype=model_dtype)
-
+    """
+    执行简化版推理，只展示输入图像和mask用于调试
+    """
     set_seed(42)
     logger.info(f"Running inference... \nEpoch: {epoch}, Step: {global_step}")
     save_dir = os.path.join(save_path, f"infer_seed{42}")
     os.makedirs(save_dir, exist_ok=True)
     triplet_paths = load_triplet_paths(args.val_json_path)
+    # size = (args.resolution, args.resolution)
     buckets = parse_buckets_string(args.aspect_ratio_buckets)
 
     for paths in triplet_paths:
@@ -141,12 +136,14 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
 
         masked_ref_image = pad_to_square(masked_ref_image, pad_value = 255, random = False) 
 
-        kernel = np.ones((7, 7), np.uint8)
-        iterations = 2
-        tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
+        # kernel = np.ones((7, 7), np.uint8)
+        # iterations = 2
+        # tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
+
+        # zome in
         tar_box_yyxx = get_bbox_from_mask(tar_mask)
-        tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=1.2)
-        tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=2.0)
+        # tar_box_yyxx_crop: 越大，对消除任务更友好(应该，否则优化建模思路，条件引导优化)
+        tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=1.5)    #1.2 1.6,
         tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop) # crop box
         y1,y2,x1,x2 = tar_box_yyxx_crop
 
@@ -349,9 +346,7 @@ def parse_args():
     parser.add_argument("--validation_steps", type=int, default=500, 
                         help="验证间隔步数")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, 
-                        help="从检查点恢复训练状态，包括优化器和学习率等")
-    parser.add_argument("--pretrained_model_path", type=str, default=None,
-                        help="从预训练模型路径加载模型权重，但不恢复训练状态")
+                        help="从检查点恢复训练")
     
     # 推理和加速参数
     parser.add_argument("--dataloader_num_workers", type=int, default=4, 
@@ -461,7 +456,6 @@ def main():
     # 确保 VAE 使用正确的数据类型, 训练的稳定性来说，vae应该使用float32 # TODO 后续验证
     if hasattr(flux_fill_pipe, "vae"):
         flux_fill_pipe.vae = flux_fill_pipe.vae.to(dtype=flux_fill_pipe.dtype)
-    
     # Move model to the appropriate device
     flux_fill_pipe.to(accelerator.device)
     
@@ -485,16 +479,9 @@ def main():
     text_encoder_2.requires_grad_(False).eval()
     transformer.requires_grad_(False)
     
-    # 主模型结构调整之前，提前加载检查点
-    if args.resume_from_checkpoint:
-        path = args.resume_from_checkpoint
-        accelerator.print(f"从检查点恢复训练，主模型结构未改变: {path}")
-        accelerator.load_state(path)
-    
-    # 增加LoRA模块和加载权重逻辑
     if args.use_lora:
         logger.info("Using LoRA for training transformer")
-        # TODO from flux kontext``
+        # TODO from flux kontext
         target_modules = [
             "attn.to_k",
             "attn.to_q",
@@ -519,45 +506,6 @@ def main():
         
         transformer.add_adapter(LoraConfig(**lora_config_dict))
         transformer.gradient_checkpointing = args.gradient_checkpointing
-        
-        # 加载预训练的LoRA权重（如果指定了）
-        pretrained_model_path = None
-        pretrained_weight_name = None
-        if args.pretrained_model_path:
-            try:
-                pretrained_model_path = args.pretrained_model_path
-                logger.info(f"将使用预训练LoRA权重: {pretrained_model_path}")
-                # 检查权重文件是否存在
-                safetensors_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.safetensors")
-                bin_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.bin")
-                
-                if os.path.exists(safetensors_path):
-                    logger.info(f"找到LoRA权重文件: {safetensors_path}")
-                    pretrained_weight_name = "pytorch_lora_weights.safetensors"
-                elif os.path.exists(bin_path):
-                    logger.info(f"找到LoRA权重文件: {bin_path}")
-                    pretrained_weight_name = "pytorch_lora_weights.bin"
-                else:
-                    logger.warning(f"在 {pretrained_model_path} 中找不到标准LoRA权重文件")
-                    pretrained_model_path = None
-            except Exception as e:
-                logger.error(f"检查预训练权重时发生错误: {str(e)}")
-                logger.info("继续使用初始化权重训练")
-                pretrained_model_path = None
-        
-        if pretrained_model_path:
-            try:
-                logger.info(f"在pipeline中加载预训练LoRA权重: {pretrained_model_path}")
-                if pretrained_weight_name:
-                    logger.info(f"使用指定的权重文件: {pretrained_weight_name}")
-                    flux_fill_pipe.load_lora_weights(pretrained_model_path, weight_name=pretrained_weight_name)
-                else:
-                    flux_fill_pipe.load_lora_weights(pretrained_model_path)
-                logger.info("成功加载LoRA权重")
-            except Exception as e:
-                logger.error(f"加载LoRA权重时出错: {str(e)}")
-                logger.info("继续使用初始化权重训练")
-                pretrained_model_path = None
         
         trainable_params = list(filter(
             lambda p: p.requires_grad, transformer.parameters()
@@ -683,36 +631,6 @@ def main():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     
-
-    global_step = 0
-    first_epoch = 0
-    if args.resume_from_checkpoint:
-        path = args.resume_from_checkpoint
-        accelerator.print(f"从检查点恢复训练，主模型结构已改变，只计算global_step: {path}")
-        # accelerator.load_state(path) # 已经有lora改变主模型结构了，
-        try:
-            global_step = int(os.path.basename(path).split("-")[-1])
-            logger.info(f"恢复训练到步骤 {global_step}")
-            first_epoch = global_step // num_update_steps_per_epoch
-        except ValueError:
-            logger.warning(f"无法从路径获取步骤信息，从步骤0开始")
-            global_step = 0
-            first_epoch = 0
-            
-    # 加载预训练的LoRA权重（如果指定了且不恢复检查点）
-    if pretrained_model_path:
-        try:
-            logger.info(f"在pipeline中加载预训练LoRA权重: {pretrained_model_path}")
-            if pretrained_weight_name:
-                logger.info(f"使用指定的权重文件: {pretrained_weight_name}")
-                flux_fill_pipe.load_lora_weights(pretrained_model_path, weight_name=pretrained_weight_name)
-            else:
-                flux_fill_pipe.load_lora_weights(pretrained_model_path)
-            logger.info("成功加载LoRA权重")
-        except Exception as e:
-            logger.error(f"加载LoRA权重时出错: {str(e)}")
-            logger.info("继续使用初始化权重训练")
-    
     if accelerator.is_main_process:
         accelerator.init_trackers("removal_training")
     
@@ -726,6 +644,16 @@ def main():
     logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
     logger.info(f"  总优化步数 = {args.max_train_steps}")
     
+    global_step = 0
+    first_epoch = 0
+    
+    if args.resume_from_checkpoint:
+        path = args.resume_from_checkpoint
+        accelerator.print(f"从检查点恢复训练: {path}")
+        accelerator.load_state(path)
+        global_step = int(path.split("-")[-1])
+        first_epoch = global_step // num_update_steps_per_epoch
+    
     progress_bar = tqdm(
         range(args.max_train_steps),
         disable=not accelerator.is_local_main_process,
@@ -733,18 +661,6 @@ def main():
     )
     
     vae = vae.to(accelerator.device)
-    
-    # 输出当前训练配置信息
-    logger.info(f"当前训练配置:")
-    logger.info(f"  - 学习率: {args.learning_rate}")
-    logger.info(f"  - 批次大小: {args.train_batch_size}")
-    logger.info(f"  - 梯度累积步数: {args.gradient_accumulation_steps}")
-    logger.info(f"  - 是否使用预训练权重: {'是' if args.pretrained_model_path else '否'}")
-    if args.pretrained_model_path:
-        logger.info(f"  - 预训练权重路径: {args.pretrained_model_path}")
-    logger.info(f"  - 是否从检查点恢复训练状态: {'是' if args.resume_from_checkpoint else '否'}")
-    if args.resume_from_checkpoint:
-        logger.info(f"  - 恢复检查点路径: {args.resume_from_checkpoint}")
     
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -850,7 +766,7 @@ def main():
                             )
                             logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{completed_steps}')}")
                 
-                if global_step % args.validation_steps == 1:
+                if global_step % args.validation_steps == 0:
                     logger.info("Running validation...")
                     try:
                         if val_dataset is not None and len(val_dataset) > 0:

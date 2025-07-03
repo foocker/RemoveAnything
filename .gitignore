@@ -6,3 +6,8 @@ idea.md
 **/__pycache__/
 change.txt
 src/train_dual_control.py
+
+output
+results
+
+
