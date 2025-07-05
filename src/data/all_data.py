@@ -112,6 +112,63 @@ def load_triplet_paths(json_path):
     return triplet_paths
 
 
+def load_triplet_paths_from_dir(dir_path):
+    """从目录结构加载三元组的文件路径，其中input和mask是配对的。
+
+    Args:
+        dir_path: 包含 'input' 和 'mask' 子目录的根路径。
+
+    Returns:
+        列表，每个元素是一个包含文件路径的字典。
+    """
+    assert os.path.isdir(dir_path), f"{dir_path} is not a valid directory"
+    
+    input_dir = os.path.join(dir_path, "input")
+    mask_dir = os.path.join(dir_path, "mask")
+
+    assert os.path.isdir(input_dir), f"'input' directory not found in {dir_path}"
+    assert os.path.isdir(mask_dir), f"'mask' directory not found in {dir_path}"
+
+    triplet_paths = []
+    invalid_pairs = []
+
+    input_files = sorted(os.listdir(input_dir))
+
+    for filename in input_files:
+        input_path = os.path.join(input_dir, filename)
+        
+        # 尝试匹配带 `_mask` 后缀的掩码文件和同名文件,可能后缀不同，暂时不考虑
+        name, ext = os.path.splitext(filename)
+        mask_filename_suffixed = f"{name}_mask{ext}"
+        mask_path_suffixed = os.path.join(mask_dir, mask_filename_suffixed)
+        mask_path_same = os.path.join(mask_dir, filename)
+        
+        mask_path = None
+        if os.path.exists(mask_path_suffixed):
+            mask_path = mask_path_suffixed
+        elif os.path.exists(mask_path_same):
+            mask_path = mask_path_same
+
+        if mask_path:
+            triplet_paths.append({
+                "input_image": input_path,
+                "edited_image": "",  # 实际推理时，edited_image可为空
+                "mask": mask_path
+            })
+        else:
+            invalid_pairs.append(filename)
+
+    print(f"在 {dir_path} 中找到了 {len(triplet_paths)} 个有效的 input/mask 对。")
+    if invalid_pairs:
+        print(f"发现 {len(invalid_pairs)} 个 input 文件缺少对应的 mask 文件:")
+        for i, fname in enumerate(invalid_pairs[:10]):
+            print(f" - {fname}")
+        if len(invalid_pairs) > 10:
+            print(f" - ...以及其他 {len(invalid_pairs)-10} 个（已省略）")
+            
+    return triplet_paths
+
+
 class TripletsData(BaseDataset):
     def __init__(self, json_path, size=(768, 768)):
         super().__init__()

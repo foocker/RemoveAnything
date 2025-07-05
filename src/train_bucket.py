@@ -22,7 +22,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm.auto import tqdm
 
-from data.all_data import load_triplet_paths
+from src.data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
 from models.image_project import image_output
 from models.transformer import tranformer_forward
@@ -105,7 +105,10 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
     logger.info(f"Running inference... \nEpoch: {epoch}, Step: {global_step}")
     save_dir = os.path.join(save_path, f"infer_seed{42}")
     os.makedirs(save_dir, exist_ok=True)
-    triplet_paths = load_triplet_paths(args.val_json_path)
+    if os.path.isdir(args.val_json_path):
+        triplet_paths = load_triplet_paths_from_dir(args.val_json_path)
+    else:
+        triplet_paths = load_triplet_paths(args.val_json_path)
     buckets = parse_buckets_string(args.aspect_ratio_buckets)
 
     for paths in triplet_paths:
@@ -631,13 +634,13 @@ def main():
         logger.error(f"加载训练数据集时发生错误: {str(e)}")
         raise
         
-    try:
-        val_dataset = TripletBucketDataset(json_path=args.val_json_path, 
-                                        buckets=buckets)
-        logger.info(f"验证集大小: {len(val_dataset)}")
-    except Exception as e:
-        logger.warning(f"加载验证集时发生错误: {str(e)}")
-        val_dataset = None
+    # try:
+    #     val_dataset = TripletBucketDataset(json_path=args.val_json_path, 
+    #                                     buckets=buckets)
+    #     logger.info(f"验证集大小: {len(val_dataset)}")
+    # except Exception as e:
+    #     logger.warning(f"加载验证集时发生错误: {str(e)}")
+    #     val_dataset = None
     
     logger.info(f"加载了 {len(train_dataset)} 个训练样本")
     
@@ -813,29 +816,34 @@ def main():
                 accelerator.log(logs, step=global_step)
                 
                 completed_steps = global_step
-                if completed_steps % args.checkpointing_steps == 0 and completed_steps > 0:
+
+                if completed_steps > 0 and completed_steps % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{completed_steps}"))
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{completed_steps}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
                         
                         if args.use_lora:
+                            unwrapped_transformer = accelerator.unwrap_model(transformer)
                             FluxFillPipeline.save_lora_weights(
                                 save_directory=os.path.join(args.output_dir, f"lora-{completed_steps}"),
-                                transformer_lora_layers=get_peft_model_state_dict(transformer),
+                                transformer_lora_layers=get_peft_model_state_dict(unwrapped_transformer),
                                 safe_serialization=True,
                             )
                             logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{completed_steps}')}")
-                
-                if global_step % args.validation_steps == 0:
-                    logger.info("Running validation...")
-                    try:
-                        if val_dataset is not None and len(val_dataset) > 0:
-                            log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-                        else:
-                            logger.warning("验证集为空或无效，跳过推理过程")
-                    except Exception as e:
-                        logger.error(f"Inference failed with error: {e}")
-                        traceback.print_exc()
-                        logger.info("尽管推理失败，但训练将继续")
+
+                if global_step > 0 and global_step % args.validation_steps == 0:
+                    if accelerator.is_main_process:
+                        logger.info("Running validation...")
+                        try:
+                            if args.val_json_path:
+                                log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                            else:
+                                logger.warning("val_json_path not provided, skipping validation.")
+                        except Exception as e:
+                            logger.error(f"Inference failed with error: {e}")
+                            traceback.print_exc()
+                            logger.info("Inference failed, but training will continue.")
             
             if global_step >= args.max_train_steps:
                 break
