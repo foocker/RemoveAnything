@@ -22,7 +22,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm.auto import tqdm
 
-from src.data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
+from data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
 from models.image_project import image_output
 from models.transformer import tranformer_forward

@@ -1,6 +1,7 @@
 train_local.sh
 infer_local.sh
 train_local_dis.sh
+run_local.sh
 .idea
 idea.md
 **/__pycache__/
