@@ -582,7 +582,7 @@ def main():
     
     # if args.enable_xformers_memory_efficient_attention:
     #     if is_xformers_available():
-    #         transformer.enable_xformers_memory_efficient_attention()  # TODO 待查transformer是否有这个方法
+    #         transformer.enable_xformers_memory_efficient_attention()  # TODO 推理报错
     #     else:
     #         logger.warning("xformers not available, memory efficient attention not enabled")
     
@@ -633,14 +633,6 @@ def main():
     except Exception as e:
         logger.error(f"加载训练数据集时发生错误: {str(e)}")
         raise
-        
-    # try:
-    #     val_dataset = TripletBucketDataset(json_path=args.val_json_path, 
-    #                                     buckets=buckets)
-    #     logger.info(f"验证集大小: {len(val_dataset)}")
-    # except Exception as e:
-    #     logger.warning(f"加载验证集时发生错误: {str(e)}")
-    #     val_dataset = None
     
     logger.info(f"加载了 {len(train_dataset)} 个训练样本")
     
