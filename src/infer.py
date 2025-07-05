@@ -25,6 +25,16 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+    
+def parser_data_dir(data_dir):
+    if not os.path.exists(data_dir):
+        raise ValueError(f"数据目录 {data_dir} 不存在")
+    img_dir = os.path.join(data_dir, "input")
+    mask_dir = os.path.join(data_dir, "mask")
+    image_list = sorted([os.path.join(img_dir, img) for img in os.listdir(img_dir)])
+    mask_list = sorted([os.path.join(mask_dir, mask) for mask in os.listdir(mask_dir)])
+    
+    return image_list, mask_list
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RemoveAnything LoRA 权重推理脚本")
@@ -40,17 +50,20 @@ def parse_args():
                         required=True,
                         help="FluxRedux模型路径")
     
-    # 图像和蒙版路径
+    # 单图片模式
     parser.add_argument("--source_image", type=str, 
-                        required=True,
                         help="源图像路径")
     parser.add_argument("--source_mask", type=str, 
-                        required=True,
                         help="源蒙版路径")
     parser.add_argument("--ref_image", type=str, 
                         help="参考图像路径，默认与源图像相同", default=None)
     parser.add_argument("--ref_mask", type=str, 
                         help="参考蒙版路径，默认与源蒙版相同", default=None)
+    
+    # 目录模式
+    parser.add_argument("--input_dir", type=str,
+                        default=None,
+                        help="输入目录，包含源图像和蒙版")
     
     # 输出路径
     parser.add_argument("--output_dir", type=str, 
@@ -71,70 +84,51 @@ def parse_args():
     
     return parser.parse_args()
 
-def main():
-    args = parse_args()
+def infer_single_image(pipe, redux, args, source_image_path, mask_image_path, 
+                       ref_image_path=None, ref_mask_path=None, device="cuda", dtype=torch.bfloat16):
+    """处理单个图像和蒙版对
     
-    # 确保输出目录存在
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # 设置设备和数据类型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16
-    logger.info(f"使用设备: {device}, 数据类型: {dtype}")
-    
-    # 加载预训练模型
-    logger.info("加载 FluxFill 模型...")
-    pipe = FluxFillPipeline.from_pretrained(
-        args.flux_fill_path,
-        torch_dtype=dtype,
-        use_safetensors=True
-    )
-    
-    # 禁用 xformers 以确保兼容性
-    if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
-        pipe._use_memory_efficient_attention_xformers = False
-        logger.info("已禁用 xformers 内存优化")
-    
-    # 加载 LoRA 权重
-    logger.info(f"加载 LoRA 权重: {args.lora_weights_path}")
-    try:
-        pipe.load_lora_weights(args.lora_weights_path)
-        logger.info("成功加载 LoRA 权重")
-    except Exception as e:
-        logger.error(f"加载 LoRA 权重出错: {str(e)}")
-        return
-    
-    # 加载 FluxPriorRedux 模型
-    logger.info("加载 FluxPriorRedux 模型...")
-    redux = FluxPriorReduxPipeline.from_pretrained(
-        args.flux_redux_path,
-        torch_dtype=dtype,
-    )
-    
-    # 将模型移至GPU
-    pipe.to(device=device, dtype=dtype)
-    redux.to(device=device, dtype=dtype)
-    logger.info("模型已加载到设备")
-    
-    # 设置随机种子
-    set_seed(args.seed)
-    
-    # 加载源图像和蒙版
-    logger.info("加载图像和蒙版...")
-    source_image_path = args.source_image
-    mask_image_path = args.source_mask
-    
+    Args:
+        pipe: FluxFillPipeline模型
+        redux: FluxPriorReduxPipeline模型
+        args: 命令行参数
+        source_image_path: 源图像路径
+        mask_image_path: 源蒙版路径
+        ref_image_path: 参考图像路径，默认与源图像相同
+        ref_mask_path: 参考蒙版路径，默认与源蒙版相同
+        device: 设备
+        dtype: 数据类型
+    """
     # 设置参考图像，如果没有提供则使用源图像
-    ref_image_path = args.ref_image if args.ref_image else source_image_path
-    ref_mask_path = args.ref_mask if args.ref_mask else mask_image_path
+    ref_image_path = ref_image_path if ref_image_path else source_image_path
+    ref_mask_path = ref_mask_path if ref_mask_path else mask_image_path
+    
+    logger.info(f"处理图像: {source_image_path} 和蒙版: {mask_image_path}")
     
     # 加载图像和蒙版
     ref_image = cv2.imread(ref_image_path)
+    if ref_image is None:
+        logger.error(f"无法加载参考图像: {ref_image_path}")
+        return
     ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
+    
     tar_image = cv2.imread(source_image_path)
+    if tar_image is None:
+        logger.error(f"无法加载源图像: {source_image_path}")
+        return
     tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
-    ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
-    tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
+    
+    ref_mask = cv2.imread(ref_mask_path)
+    if ref_mask is None:
+        logger.error(f"无法加载参考蒙版: {ref_mask_path}")
+        return
+    ref_mask = (ref_mask > 128).astype(np.uint8)[:, :, 0]
+    
+    tar_mask = cv2.imread(mask_image_path)
+    if tar_mask is None:
+        logger.error(f"无法加载源蒙版: {mask_image_path}")
+        return
+    tar_mask = (tar_mask > 128).astype(np.uint8)[:, :, 0]
     
     # 确保蒙版和图像尺寸匹配
     if tar_mask.shape[:2] != (tar_image.shape[0], tar_image.shape[1]):
@@ -168,8 +162,8 @@ def main():
     tar_box_yyxx = get_bbox_from_mask(tar_mask)
     # 先扩展蒙版区域
     tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=1.2)
-    # 再扩展到更大的裁剪区域，infer.py 中固定使用 ratio=2
-    tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=2.0)   
+    # 再扩展到更大的裁剪区域
+    tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=args.expansion_ratio)   
     tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop)
     y1, y2, x1, x2 = tar_box_yyxx_crop
     
@@ -222,6 +216,8 @@ def main():
     repeat = args.repeat
     num_inference_steps = args.num_inference_steps
     
+    results = []
+    
     for seed_idx, seed in enumerate(seeds):
         logger.info(f"使用种子 {seed} 进行推理 ({seed_idx + 1}/{len(seeds)})")
         generator = torch.Generator(device).manual_seed(seed)
@@ -265,10 +261,115 @@ def main():
             output_path = os.path.join(args.output_dir, output_filename)
             edited_image.save(output_path)
             logger.info(f"结果已保存到: {output_path}")
+            results.append(output_path)
     
+    return results
+
+
+def load_weights(args, device, dtype):
+    # 加载预训练模型
+    logger.info("加载 FluxFill 模型...")
+    pipe = FluxFillPipeline.from_pretrained(
+        args.flux_fill_path,
+        torch_dtype=dtype,
+        use_safetensors=True
+    )
+    
+    # 禁用 xformers 以确保兼容性
+    if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+        pipe._use_memory_efficient_attention_xformers = False
+        logger.info("已禁用 xformers 内存优化")
+    
+    # 加载 LoRA 权重
+    logger.info(f"加载 LoRA 权重: {args.lora_weights_path}")
+    try:
+        pipe.load_lora_weights(args.lora_weights_path)
+        logger.info("成功加载 LoRA 权重")
+    except Exception as e:
+        logger.error(f"加载 LoRA 权重出错: {str(e)}")
+        return
+    
+    # 加载 FluxPriorRedux 模型
+    logger.info("加载 FluxPriorRedux 模型...")
+    redux = FluxPriorReduxPipeline.from_pretrained(
+        args.flux_redux_path,
+        torch_dtype=dtype,
+    )
+    
+    # 将模型移至GPU
+    pipe.to(device=device, dtype=dtype)
+    redux.to(device=device, dtype=dtype)
+    
+    logger.info("模型已加载到设备")
+    
+    return pipe, redux
+
+
+def main():
+    args = parse_args()
+    
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 设置设备和数据类型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
+    logger.info(f"使用设备: {device}, 数据类型: {dtype}")
+    
+    # 加载模型权重
+    pipe, redux = load_weights(args, device, dtype)
+        
+    # 设置随机种子
+    set_seed(args.seed)
+        
+    input_dir = args.input_dir if args.input_dir is not None else ""
+    
+    if os.path.isdir(input_dir):
+        logger.info(f"使用目录模式，解析目录: {input_dir}")
+        image_list, mask_list = parser_data_dir(input_dir)
+        
+        for source_image_path, mask_image_path in zip(image_list, mask_list):
+            infer_single_image(
+                pipe=pipe,
+                redux=redux,
+                args=args,
+                source_image_path=source_image_path,
+                mask_image_path=mask_image_path,
+                ref_image_path=source_image_path,
+                ref_mask_path=mask_image_path,
+                device=device,
+                dtype=dtype
+            )
+            
+    else:
+        # 单图片模式
+        logger.info("使用单图片模式")
+        source_image_path = args.source_image
+        mask_image_path = args.source_mask
+            
+        # 检查必要的参数
+        if not source_image_path or not mask_image_path:
+            logger.error("单图片模式下必须提供source_image和source_mask参数")
+            return
+            
+        # 设置参考图像，如果没有提供则使用源图像
+        ref_image_path = args.ref_image if args.ref_image else source_image_path
+        ref_mask_path = args.ref_mask if args.ref_mask else mask_image_path
+            
+        # 调用单图片处理函数
+        infer_single_image(
+            pipe=pipe,
+            redux=redux,
+            args=args,
+            source_image_path=source_image_path,
+            mask_image_path=mask_image_path,
+            ref_image_path=ref_image_path,
+            ref_mask_path=ref_mask_path,
+            device=device,
+            dtype=dtype
+        )
+            
     logger.info("推理完成!")
-    
-    # 清理显存
     torch.cuda.empty_cache()
 
 if __name__ == "__main__":

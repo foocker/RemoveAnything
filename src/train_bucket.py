@@ -44,7 +44,6 @@ from data.data_utils import (
     crop_back
 )
 
-
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -397,7 +396,7 @@ def parse_args():
 def main():
     # Initialize PartialState before any logging
     from accelerate.state import PartialState
-    _ = PartialState()  # 为啥，后续看 TODO
+    _ = PartialState()  # TODO
     
     args = parse_args()
     
@@ -485,13 +484,7 @@ def main():
     text_encoder_2.requires_grad_(False).eval()
     transformer.requires_grad_(False)
     
-    # 主模型结构调整之前，提前加载检查点
-    if args.resume_from_checkpoint:
-        path = args.resume_from_checkpoint
-        accelerator.print(f"从检查点恢复训练，主模型结构未改变: {path}")
-        accelerator.load_state(path)
-    
-    # 增加LoRA模块和加载权重逻辑
+    # 增加LoRA模块
     if args.use_lora:
         logger.info("Using LoRA for training transformer")
         # TODO from flux kontext``
@@ -517,33 +510,43 @@ def main():
             "target_modules": target_modules
         }
         
+        logger.info("添加LoRA适配器")
         transformer.add_adapter(LoraConfig(**lora_config_dict))
         transformer.gradient_checkpointing = args.gradient_checkpointing
-        
-        # 加载预训练的LoRA权重（如果指定了）
+    
+    # accelerator.load_state会恢复完整的模型状态（包括基础权重和LoRA适配器）以及优化器/调度器状态。
+    if args.resume_from_checkpoint:
+        path = args.resume_from_checkpoint
+        accelerator.print(f"从检查点恢复训练: {path}")
+        accelerator.load_state(path)
+        logger.info("检查点恢复完成，模型、优化器等状态已从检查点加载。")
+
+    # 使用预训练的LoRA权重进行初始化。
+    elif args.use_lora and args.pretrained_model_path:
+        # 加载独立的LoRA权重文件
+        logger.info("加载预训练LoRA权重")
         pretrained_model_path = None
         pretrained_weight_name = None
-        if args.pretrained_model_path:
-            try:
-                pretrained_model_path = args.pretrained_model_path
-                logger.info(f"将使用预训练LoRA权重: {pretrained_model_path}")
-                # 检查权重文件是否存在
-                safetensors_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.safetensors")
-                bin_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.bin")
-                
-                if os.path.exists(safetensors_path):
-                    logger.info(f"找到LoRA权重文件: {safetensors_path}")
-                    pretrained_weight_name = "pytorch_lora_weights.safetensors"
-                elif os.path.exists(bin_path):
-                    logger.info(f"找到LoRA权重文件: {bin_path}")
-                    pretrained_weight_name = "pytorch_lora_weights.bin"
-                else:
-                    logger.warning(f"在 {pretrained_model_path} 中找不到标准LoRA权重文件")
-                    pretrained_model_path = None
-            except Exception as e:
-                logger.error(f"检查预训练权重时发生错误: {str(e)}")
-                logger.info("继续使用初始化权重训练")
+        try:
+            pretrained_model_path = args.pretrained_model_path
+            logger.info(f"将使用预训练LoRA权重: {pretrained_model_path}")
+            # 检查权重文件是否存在
+            safetensors_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.safetensors")
+            bin_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.bin")
+            
+            if os.path.exists(safetensors_path):
+                logger.info(f"找到LoRA权重文件: {safetensors_path}")
+                pretrained_weight_name = "pytorch_lora_weights.safetensors"
+            elif os.path.exists(bin_path):
+                logger.info(f"找到LoRA权重文件: {bin_path}")
+                pretrained_weight_name = "pytorch_lora_weights.bin"
+            else:
+                logger.warning(f"在 {pretrained_model_path} 中找不到标准LoRA权重文件")
                 pretrained_model_path = None
+        except Exception as e:
+            logger.error(f"检查预训练权重时发生错误: {str(e)}")
+            logger.info("继续使用初始化权重训练")
+            pretrained_model_path = None
         
         if pretrained_model_path:
             try:
@@ -557,15 +560,19 @@ def main():
             except Exception as e:
                 logger.error(f"加载LoRA权重时出错: {str(e)}")
                 logger.info("继续使用初始化权重训练")
-                pretrained_model_path = None
-        
+    
+    # 设置可训练参数（在所有检查点恢复和LoRA权重加载之后）
+    if args.use_lora:
+        # LoRA模式：只训练LoRA参数
         trainable_params = list(filter(
             lambda p: p.requires_grad, transformer.parameters()
         ))
-        logger.info(f"可训练参数数量: {len(trainable_params)}")
+        logger.info(f"LoRA模式 - 可训练参数数量: {len(trainable_params)}")
     else:
+        # 全量微调模式：训练所有transformer参数
         transformer.requires_grad_(True)
         trainable_params = transformer.parameters()
+        logger.info("全量微调模式 - 训练所有transformer参数")
     
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
@@ -619,25 +626,6 @@ def main():
         
         if len(train_dataset) == 0:
             logger.error("训练数据集为空，请检查数据路径和文件格式")
-            logger.error(f"检查数据目录结构: {args.train_json_path}")
-            
-            # 检查目录结构
-            train_dir = os.path.dirname(args.train_json_path)
-            logger.info(f"列出目录结构: {train_dir}")
-            subdirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
-            logger.info(f"子目录: {subdirs}")
-            
-            # 检查JSON文件格式
-            with open(args.train_json_path, "r") as f:
-                data = json.load(f)
-                logger.info(f"JSON文件中的字段: {list(data.keys())}")
-                if "mapping" in data:
-                    mapping_count = len(data["mapping"])
-                    logger.info(f"Mapping项数量: {mapping_count}")
-                    if mapping_count > 0:
-                        sample_key = next(iter(data["mapping"].keys()))
-                        logger.info(f"示例映射: {sample_key} -> {data['mapping'][sample_key]}")
-            
             raise ValueError("训练数据集为空，请检查日志中的路径和文件格式信息")
     except Exception as e:
         logger.error(f"加载训练数据集时发生错误: {str(e)}")
@@ -680,6 +668,7 @@ def main():
         transformer, optimizer, train_dataloader, lr_scheduler
     )
     
+    # prepare 需要重新计算 num_update_steps_per_epoch
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     
@@ -699,20 +688,6 @@ def main():
             global_step = 0
             first_epoch = 0
             
-    # 加载预训练的LoRA权重（如果指定了且不恢复检查点）
-    if pretrained_model_path:
-        try:
-            logger.info(f"在pipeline中加载预训练LoRA权重: {pretrained_model_path}")
-            if pretrained_weight_name:
-                logger.info(f"使用指定的权重文件: {pretrained_weight_name}")
-                flux_fill_pipe.load_lora_weights(pretrained_model_path, weight_name=pretrained_weight_name)
-            else:
-                flux_fill_pipe.load_lora_weights(pretrained_model_path)
-            logger.info("成功加载LoRA权重")
-        except Exception as e:
-            logger.error(f"加载LoRA权重时出错: {str(e)}")
-            logger.info("继续使用初始化权重训练")
-    
     if accelerator.is_main_process:
         accelerator.init_trackers("removal_training")
     
@@ -850,7 +825,7 @@ def main():
                             )
                             logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{completed_steps}')}")
                 
-                if global_step % args.validation_steps == 1:
+                if global_step % args.validation_steps == 0:
                     logger.info("Running validation...")
                     try:
                         if val_dataset is not None and len(val_dataset) > 0:
