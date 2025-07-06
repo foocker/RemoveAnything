@@ -128,6 +128,7 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         tar_image = cv2.cvtColor(tar_image, cv2.COLOR_BGR2RGB)
         ref_mask = (cv2.imread(ref_mask_path) > 128).astype(np.uint8)[:, :, 0]
         tar_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
+        tar_mask_original = tar_mask.copy()
 
         if tar_mask.shape != tar_image.shape:
             tar_mask = cv2.resize(tar_mask, (tar_image.shape[1], tar_image.shape[0]))
@@ -211,9 +212,9 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         original_image = Image.fromarray(old_tar_image)
         # Convert mask to a visible format (ensure it's RGB)
         visible_mask = Image.fromarray(
-            np.where(tar_mask > 0, np.ones_like(old_tar_image) * 255, old_tar_image).astype(np.uint8)
-            if len(tar_mask.shape) == 3 else
-            np.stack([tar_mask * 255, tar_mask * 255, tar_mask * 255], axis=-1).astype(np.uint8)
+            np.where(tar_mask_original > 0, np.ones_like(old_tar_image) * 255, old_tar_image).astype(np.uint8)
+            if len(tar_mask_original.shape) == 3 else
+            np.stack([tar_mask_original * 255, tar_mask_original * 255, tar_mask_original * 255], axis=-1).astype(np.uint8)
         )
         
         # Create composite image by concatenating horizontally
