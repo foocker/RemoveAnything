@@ -53,7 +53,6 @@ def main(args):
 
     loader = None
 
-
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode

@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-import json
 import os
 import argparse
 import logging
@@ -21,6 +20,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm.auto import tqdm
+from optimizer.muon import MuonWithAuxAdam
 
 from data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
@@ -101,9 +101,9 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
     pipefill.to(dtype=model_dtype)
     pipeprior.to(dtype=model_dtype)
 
-    set_seed(42)
+    set_seed(args.seed)
     logger.info(f"Running inference... \nEpoch: {epoch}, Step: {global_step}")
-    save_dir = os.path.join(save_path, f"infer_seed{42}")
+    save_dir = os.path.join(save_path, f"infer_seed{args.seed}")
     os.makedirs(save_dir, exist_ok=True)
     if os.path.isdir(args.val_json_path):
         triplet_paths = load_triplet_paths_from_dir(args.val_json_path)
@@ -206,10 +206,26 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         edited_image = np.array(edited_image)
         edited_image = crop_back(edited_image, old_tar_image, np.array([H1, W1, H2, W2]), np.array(tar_box_yyxx_crop)) 
         edited_image = Image.fromarray(edited_image)
-
-        # Save the result
-        edited_image_save_path = os.path.join(save_dir, f"seed{42}_epoch_{epoch}_step_{global_step}_{file_name}")
-        edited_image.save(edited_image_save_path)
+        
+        # Create a composite image: original input (left) + mask (middle) + output (right)
+        original_image = Image.fromarray(old_tar_image)
+        # Convert mask to a visible format (ensure it's RGB)
+        visible_mask = Image.fromarray(
+            np.where(tar_mask > 0, np.ones_like(old_tar_image) * 255, old_tar_image).astype(np.uint8)
+            if len(tar_mask.shape) == 3 else
+            np.stack([tar_mask * 255, tar_mask * 255, tar_mask * 255], axis=-1).astype(np.uint8)
+        )
+        
+        # Create composite image by concatenating horizontally
+        total_width = original_image.width + visible_mask.width + edited_image.width
+        composite_image = Image.new('RGB', (total_width, original_image.height))
+        
+        composite_image.paste(original_image, (0, 0))
+        composite_image.paste(visible_mask, (original_image.width, 0))
+        composite_image.paste(edited_image, (original_image.width + visible_mask.width, 0))
+        
+        edited_image_save_path = os.path.join(save_dir, f"seed{args.seed}_epoch_{epoch}_step_{global_step}_{file_name}")
+        composite_image.save(edited_image_save_path)
         
     del pipefill, pipeprior
     torch.cuda.empty_cache()
@@ -325,7 +341,7 @@ def parse_args():
     
     # 优化器
     parser.add_argument("--optimizer_type", type=str, default="adamw", 
-                        help="优化器类型, Prodigy, adamw, etc.")    
+                        help="优化器类型, Prodigy, adamw, muon, etc.")    
     parser.add_argument("--lr_warmup_steps", type=int, default=500, 
                         help="学习率预热步数")
     parser.add_argument("--adam_beta1", type=float, default=0.9, 
@@ -386,6 +402,14 @@ def parse_args():
                     "weight_decay": args.adam_weight_decay,
                     "use_bias_correction": True,
                     "safeguard_warmup": True
+                }
+            }
+        elif args.optimizer_type.lower() == "muon":
+            args.optimizer_config = {
+                "type": "Muon",
+                "params": {
+                    "lr": args.learning_rate,
+                    "weight_decay": args.adam_weight_decay
                 }
             }
         else:  # adamw
@@ -609,6 +633,34 @@ def main():
                 weight_decay=args.adam_weight_decay,
                 eps=args.adam_epsilon
             )
+    elif optimizer_type.lower() == "muon":
+        try:
+            # 为Muon优化器分组参数
+            muon_groups = [param for name, param in transformer.named_parameters() 
+                          if param.requires_grad and param.ndim >= 2 and 
+                          "pos_embed" not in name and "final_layer" not in name and 
+                          "x_embedder" not in name and "t_embedder" not in name and "y_embedder" not in name]
+            
+            adamw_groups = [param for name, param in transformer.named_parameters() 
+                           if param.requires_grad and not (param.ndim >= 2 and 
+                           "pos_embed" not in name and "final_layer" not in name and 
+                           "x_embedder" not in name and "t_embedder" not in name and "y_embedder" not in name)]
+            
+            optimizer = MuonWithAuxAdam([
+                {"params": muon_groups, "use_muon": True, "lr": args.learning_rate, "weight_decay": args.adam_weight_decay},
+                {"params": adamw_groups, "use_muon": False, "lr": args.learning_rate * 0.1, "weight_decay": args.adam_weight_decay}
+            ])
+            logger.info(f"使用Muon优化器，主参数lr={args.learning_rate}，辅助参数lr={args.learning_rate * 0.1}")
+            logger.info(f"Muon参数组数量: {len(muon_groups)}，AdamW参数组数量: {len(adamw_groups)}")
+        except ImportError:
+            logger.warning("无法导入Muon优化器，回退到AdamW")
+            optimizer = torch.optim.AdamW(
+                list(trainable_params),
+                lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2),
+                weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon
+            )
     else:
         optimizer = torch.optim.AdamW(
             list(trainable_params),
@@ -667,7 +719,6 @@ def main():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     
-
     global_step = 0
     first_epoch = 0
     if args.resume_from_checkpoint:
@@ -843,6 +894,7 @@ def main():
         # 每轮结束后记录平均损失
         accelerator.log({"epoch_loss": train_loss / len(train_dataloader)}, step=global_step)
     
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         if args.use_lora:
             unwrapped_transformer = accelerator.unwrap_model(transformer)
@@ -867,6 +919,8 @@ def main():
             )
             flux_pipe_new.save_pretrained(final_save_path)
             logger.info(f"\n训练完成！最终模型保存至 {final_save_path}")
+            
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

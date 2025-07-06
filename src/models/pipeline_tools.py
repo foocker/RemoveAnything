@@ -39,7 +39,7 @@ def Flux_fill_encode_masks_images(pipeline: FluxFillPipeline, images, masks):
     return images_tokens, masks_tokens
 
 
-def encode_images(pipeline, images):
+def encode_images(pipeline: FluxFillPipeline, images):
     images = pipeline.image_processor.preprocess(images)
     images = images.to(pipeline.device).to(pipeline.dtype)
     images = pipeline.vae.encode(images).latent_dist.sample()

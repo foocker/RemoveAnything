@@ -280,13 +280,42 @@ def load_weights(args, device, dtype):
         pipe._use_memory_efficient_attention_xformers = False
         logger.info("已禁用 xformers 内存优化")
     
+    transformer = pipe.transformer
+    target_modules = [
+        "attn.to_k",
+        "attn.to_q",
+        "attn.to_v",
+        "attn.to_out.0",
+        "attn.add_k_proj",
+        "attn.add_q_proj",
+        "attn.add_v_proj",
+        "attn.to_add_out",
+        "ff.net.0.proj",
+        "ff.net.2",
+        "ff_context.net.0.proj",
+        "ff_context.net.2",
+    ]
+    
+    from peft import LoraConfig
+    lora_config = LoraConfig(
+        r=64,  # 可根据训练中使用的值调整
+        lora_alpha=64,  # 可根据训练中使用的值调整
+        init_lora_weights="gaussian",
+        target_modules=target_modules
+    )
+    
+    logger.info("添加LoRA适配器配置")
+    transformer.add_adapter(lora_config)
+    
     # 加载 LoRA 权重
     logger.info(f"加载 LoRA 权重: {args.lora_weights_path}")
     try:
+        # 加载 LoRA 权重
         pipe.load_lora_weights(args.lora_weights_path)
         logger.info("成功加载 LoRA 权重")
     except Exception as e:
-        logger.error(f"加载 LoRA 权重出错: {str(e)}")
+        logger.error(f"LoRA 适配器配置或权重加载出错: {str(e)}")
+        logger.error("请确保 PEFT 库版本与训练时一致")
         return
     
     # 加载 FluxPriorRedux 模型
@@ -301,7 +330,6 @@ def load_weights(args, device, dtype):
     redux.to(device=device, dtype=dtype)
     
     logger.info("模型已加载到设备")
-    
     return pipe, redux
 
 
