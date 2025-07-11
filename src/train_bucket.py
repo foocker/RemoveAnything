@@ -17,10 +17,19 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
 from diffusers.optimization import get_scheduler
+from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.utils.import_utils import is_xformers_available
-from peft import LoraConfig, get_peft_model_state_dict
+from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from tqdm.auto import tqdm
 from optimizer.muon import MuonWithAuxAdam
+
+from diffusers.training_utils import (
+    _collate_lora_metadata,
+    cast_training_params,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+    free_memory
+)
 
 from data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
@@ -188,7 +197,7 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         mask_diptych[mask_diptych == 1] = 255
         mask_diptych = Image.fromarray(mask_diptych)
 
-        generator = torch.Generator(accelerator.device,).manual_seed(42)
+        generator = torch.Generator(accelerator.device,).manual_seed(args.seed)
         edited_image = pipefill(
             image=diptych_ref_tar,
             mask_image=mask_diptych,
@@ -367,6 +376,8 @@ def parse_args():
                         help="检查点保存间隔步数")
     parser.add_argument("--validation_steps", type=int, default=500, 
                         help="验证间隔步数")
+    parser.add_argument("--validation_epochs", type=int, default=1, 
+                        help="验证间隔步数")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, 
                         help="从检查点恢复训练状态，包括优化器和学习率等")
     parser.add_argument("--pretrained_model_path", type=str, default=None,
@@ -540,54 +551,64 @@ def main():
         
         logger.info("添加LoRA适配器")
         transformer.add_adapter(LoraConfig(**lora_config_dict))
-        transformer.gradient_checkpointing = args.gradient_checkpointing
-    
-    # accelerator.load_state会恢复完整的模型状态（包括基础权重和LoRA适配器）以及优化器/调度器状态。
-    if args.resume_from_checkpoint:
-        path = args.resume_from_checkpoint
-        accelerator.print(f"从检查点恢复训练: {path}")
-        accelerator.load_state(path)
-        logger.info("检查点恢复完成，模型、优化器等状态已从检查点加载。")
-
-    # 使用预训练的LoRA权重进行初始化。
-    elif args.use_lora and args.pretrained_model_path:
-        # 加载独立的LoRA权重文件
-        logger.info("加载预训练LoRA权重")
-        pretrained_model_path = None
-        pretrained_weight_name = None
-        try:
-            pretrained_model_path = args.pretrained_model_path
-            logger.info(f"将使用预训练LoRA权重: {pretrained_model_path}")
-            # 检查权重文件是否存在
-            safetensors_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.safetensors")
-            bin_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.bin")
-            
-            if os.path.exists(safetensors_path):
-                logger.info(f"找到LoRA权重文件: {safetensors_path}")
-                pretrained_weight_name = "pytorch_lora_weights.safetensors"
-            elif os.path.exists(bin_path):
-                logger.info(f"找到LoRA权重文件: {bin_path}")
-                pretrained_weight_name = "pytorch_lora_weights.bin"
-            else:
-                logger.warning(f"在 {pretrained_model_path} 中找不到标准LoRA权重文件")
-                pretrained_model_path = None
-        except Exception as e:
-            logger.error(f"检查预训练权重时发生错误: {str(e)}")
-            logger.info("继续使用初始化权重训练")
-            pretrained_model_path = None
         
-        if pretrained_model_path:
-            try:
-                logger.info(f"在pipeline中加载预训练LoRA权重: {pretrained_model_path}")
-                if pretrained_weight_name:
-                    logger.info(f"使用指定的权重文件: {pretrained_weight_name}")
-                    flux_fill_pipe.load_lora_weights(pretrained_model_path, weight_name=pretrained_weight_name)
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+    
+    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            transformer_lora_layers_to_save = None
+            modules_to_save = {}
+            for model in models:
+                if isinstance(model, type(unwrap_model(transformer))):
+                    transformer_lora_layers_to_save = get_peft_model_state_dict(model)
+                    modules_to_save["transformer"] = model
                 else:
-                    flux_fill_pipe.load_lora_weights(pretrained_model_path)
-                logger.info("成功加载LoRA权重")
-            except Exception as e:
-                logger.error(f"加载LoRA权重时出错: {str(e)}")
-                logger.info("继续使用初始化权重训练")
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+            FluxFillPipeline.save_lora_weights(
+                output_dir,
+                transformer_lora_layers=transformer_lora_layers_to_save,
+                **_collate_lora_metadata(modules_to_save),
+            )
+            
+    def load_model_hook(models, input_dir):
+        transformer_ = None
+        while len(models) > 0:
+            model = models.pop()
+            if isinstance(model, type(unwrap_model(transformer))):
+                transformer_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+        lora_state_dict = FluxFillPipeline.lora_state_dict(input_dir)
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+                
+        # Make sure the trainable params are in float32. This is again needed since the base models
+        # are in `weight_dtype`. More details:
+        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        if args.mixed_precision == "fp16":
+            models = [transformer_]
+            # only upcast trainable parameters (LoRA) into fp32
+            cast_training_params(models)
+    
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
     
     # 设置可训练参数（在所有检查点恢复和LoRA权重加载之后）
     if args.use_lora:
@@ -720,25 +741,76 @@ def main():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     
+    if accelerator.is_main_process:
+        accelerator.init_trackers("removal_training")
+    
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    
     global_step = 0
     first_epoch = 0
     if args.resume_from_checkpoint:
         path = args.resume_from_checkpoint
         accelerator.print(f"从检查点恢复训练，主模型结构已改变，只计算global_step: {path}")
-        # accelerator.load_state(path) # 已经有lora改变主模型结构了，
+        accelerator.load_state(path)
         try:
             global_step = int(os.path.basename(path).split("-")[-1])
             logger.info(f"恢复训练到步骤 {global_step}")
             first_epoch = global_step // num_update_steps_per_epoch
+            initial_global_step = global_step
         except ValueError:
             logger.warning(f"无法从路径获取步骤信息，从步骤0开始")
             global_step = 0
             first_epoch = 0
-            
-    if accelerator.is_main_process:
-        accelerator.init_trackers("removal_training")
+            initial_global_step = 0
+    else:
+        initial_global_step = 0
     
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    # 使用预训练的LoRA权重进行初始化。
+    if args.use_lora and args.pretrained_model_path:
+        # 加载独立的LoRA权重文件
+        logger.info("加载预训练LoRA权重")
+        pretrained_model_path = None
+        pretrained_weight_name = None
+        try:
+            pretrained_model_path = args.pretrained_model_path
+            logger.info(f"将使用预训练LoRA权重: {pretrained_model_path}")
+            # 检查权重文件是否存在
+            safetensors_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.safetensors")
+            bin_path = os.path.join(pretrained_model_path, "pytorch_lora_weights.bin")
+            
+            if os.path.exists(safetensors_path):
+                logger.info(f"找到LoRA权重文件: {safetensors_path}")
+                pretrained_weight_name = "pytorch_lora_weights.safetensors"
+            elif os.path.exists(bin_path):
+                logger.info(f"找到LoRA权重文件: {bin_path}")
+                pretrained_weight_name = "pytorch_lora_weights.bin"
+            else:
+                logger.warning(f"在 {pretrained_model_path} 中找不到标准LoRA权重文件")
+                pretrained_model_path = None
+        except Exception as e:
+            logger.error(f"检查预训练权重时发生错误: {str(e)}")
+            logger.info("继续使用初始化权重训练")
+            pretrained_model_path = None
+        
+        if pretrained_model_path:
+            try:
+                logger.info(f"在pipeline中加载预训练LoRA权重: {pretrained_model_path}")
+                if pretrained_weight_name:
+                    logger.info(f"使用指定的权重文件: {pretrained_weight_name}")
+                    flux_fill_pipe.load_lora_weights(pretrained_model_path, weight_name=pretrained_weight_name)
+                else:
+                    flux_fill_pipe.load_lora_weights(pretrained_model_path)
+                logger.info("成功加载LoRA权重")
+            except Exception as e:
+                logger.error(f"加载LoRA权重时出错: {str(e)}")
+                logger.info("继续使用初始化权重训练")
+    
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        disable=not accelerator.is_local_main_process,
+        desc="Steps"
+    )
     
     logger.info("***** 开始训练 *****")
     logger.info(f"  样本数量 = {len(train_dataset)}")
@@ -748,15 +820,6 @@ def main():
     logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
     logger.info(f"  总优化步数 = {args.max_train_steps}")
     
-    progress_bar = tqdm(
-        range(args.max_train_steps),
-        disable=not accelerator.is_local_main_process,
-        desc="训练步骤"
-    )
-    
-    vae = vae.to(accelerator.device)
-    
-    # 输出当前训练配置信息
     logger.info(f"当前训练配置:")
     logger.info(f"  - 学习率: {args.learning_rate}")
     logger.info(f"  - 批次大小: {args.train_batch_size}")
@@ -856,42 +919,57 @@ def main():
                 global_step += 1
                 
                 train_loss += loss.detach().item()
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step_time": step_time}
-                accelerator.log(logs, step=global_step)
                 
-                completed_steps = global_step
-
-                if completed_steps > 0 and completed_steps % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{completed_steps}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        
-                        if args.use_lora:
-                            unwrapped_transformer = accelerator.unwrap_model(transformer)
-                            FluxFillPipeline.save_lora_weights(
-                                save_directory=os.path.join(args.output_dir, f"lora-{completed_steps}"),
-                                transformer_lora_layers=get_peft_model_state_dict(unwrapped_transformer),
-                                safe_serialization=True,
-                            )
-                            logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{completed_steps}')}")
-
-                if global_step > 0 and global_step % args.validation_steps == 0:
-                    if accelerator.is_main_process:
-                        logger.info("Running validation...")
-                        try:
-                            if args.val_json_path:
-                                log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-                            else:
-                                logger.warning("val_json_path not provided, skipping validation.")
-                        except Exception as e:
-                            logger.error(f"Inference failed with error: {e}")
-                            traceback.print_exc()
-                            logger.info("Inference failed, but training will continue.")
+                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved state to {save_path}")
+                    
+                    if args.use_lora:
+                        unwrapped_transformer = accelerator.unwrap_model(transformer)
+                        FluxFillPipeline.save_lora_weights(
+                            save_directory=os.path.join(args.output_dir, f"lora-{global_step}"),
+                            transformer_lora_layers=get_peft_model_state_dict(unwrapped_transformer),
+                            safe_serialization=True,
+                        )
+                        logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{global_step}')}")
+                
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step_time": step_time}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
             
             if global_step >= args.max_train_steps:
                 break
-        
+            
+            # # debug 用，快速验证validation 
+            # if accelerator.is_main_process:
+            #     if global_step > 1 and global_step % args.validation_steps == 0:
+            #         logger.info("Running validation...")
+            #         try:
+            #             if args.val_json_path:
+            #                 log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+            #                 free_memory()
+            #             else:
+            #                 logger.warning("val_json_path not provided, skipping validation.")
+            #         except Exception as e:
+            #             logger.error(f"Inference failed with error: {e}")
+            #             traceback.print_exc()
+            #             logger.info("Inference failed, but training will continue.")
+                
+        if accelerator.is_main_process:
+            if epoch > 0 and epoch % args.validation_epochs == 0:
+                logger.info("Running validation...")
+                try:
+                    if args.val_json_path:
+                        log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                        free_memory()
+                    else:
+                        logger.warning("val_json_path not provided, skipping validation.")
+                except Exception as e:
+                    logger.error(f"Inference failed with error: {e}")
+                    traceback.print_exc()
+                    logger.info("Inference failed, but training will continue.")
+                    
         # 每轮结束后记录平均损失
         accelerator.log({"epoch_loss": train_loss / len(train_dataloader)}, step=global_step)
     
