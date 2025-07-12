@@ -7,7 +7,7 @@ idea.md
 **/__pycache__/
 change.txt
 src/train_dual_control.py
-src/trian_moe_lora_flux_kontext.py
+src/train_moe_lora_flux_kontext.py
 
 output
 results
