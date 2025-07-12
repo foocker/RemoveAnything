@@ -22,6 +22,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from tqdm.auto import tqdm
 from optimizer.muon import MuonWithAuxAdam
+from copy import deepcopy
 
 from diffusers.training_utils import (
     _collate_lora_metadata,
@@ -190,7 +191,7 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         diptych_ref_tar = np.concatenate([masked_ref_image, tar_image], axis=1)
 
         tar_mask = np.stack([tar_mask, tar_mask, tar_mask], -1)
-        mask_black = np.ones_like(tar_image) * 0
+        mask_black = np.ones_like(tar_image) * 0  # TODO may not reasonable, tar mask may be better? if in-eontext is better
         mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
 
         diptych_ref_tar = Image.fromarray(diptych_ref_tar)
@@ -237,6 +238,164 @@ def log_infer(accelerator, args, save_path, epoch, global_step,
         edited_image_save_path = os.path.join(save_dir, f"seed{args.seed}_epoch_{epoch}_step_{global_step}_{file_name}")
         composite_image.save(edited_image_save_path)
         
+    del pipefill, pipeprior
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+
+def log_infer_custom(accelerator, args, save_path, epoch, global_step, 
+               pipefill: "FluxFillPipeline", pipeprior: "FluxPriorReduxPipeline"):
+    model_dtype = torch.bfloat16
+    logger.info(f"Setting all model components to use {model_dtype}")
+    
+    if hasattr(pipefill, "vae") and hasattr(pipefill.vae, "_decode"):
+        original_decode = pipefill.vae._decode
+        
+        class DecoderPatch:
+            def __init__(self, pipe, orig_decode, dtype):
+                self.pipe = pipe
+                self.original_decode = orig_decode
+                self.dtype = dtype
+                
+            def __call__(self, z):
+                z = z.to(dtype=self.dtype)
+                with torch.no_grad():
+                    for module in self.pipe.vae.decoder.named_modules():
+                        if hasattr(module, "weight") and module.weight is not None:
+                            if module.weight.dtype != self.dtype:
+                                module.weight.data = module.weight.data.to(self.dtype)
+                        if hasattr(module, "bias") and module.bias is not None:
+                            if module.bias.dtype != self.dtype:
+                                module.bias.data = module.bias.data.to(self.dtype)
+                    
+                    try:
+                        return self.original_decode(z)
+                    except Exception as e:
+                        logger.warning(f"Error in patched decode: {e}")
+                        logger.info("Falling back to float32 for this operation")
+                        z_float = z.to(dtype=torch.float32)
+                        self.pipe.vae.decoder = self.pipe.vae.decoder.to(dtype=torch.float32)
+                        result = self.original_decode(z_float)
+                        self.pipe.vae.decoder = self.pipe.vae.decoder.to(dtype=self.dtype)
+                        return result
+        
+        pipefill.vae._decode = DecoderPatch(pipefill, original_decode, model_dtype)
+        logger.info("Successfully patched VAE decoder method")
+    
+    pipefill.to(dtype=model_dtype)
+    pipeprior.to(dtype=model_dtype)
+
+    set_seed(args.seed)
+    logger.info(f"Running inference with custom processing... \nEpoch: {epoch}, Step: {global_step}")
+    save_dir = os.path.join(save_path, f"infer_custom_seed{args.seed}")
+    os.makedirs(save_dir, exist_ok=True)
+    if os.path.isdir(args.val_json_path):
+        triplet_paths = load_triplet_paths_from_dir(args.val_json_path)
+    else:
+        triplet_paths = load_triplet_paths(args.val_json_path)
+    buckets = parse_buckets_string(args.aspect_ratio_buckets)
+
+    for paths in triplet_paths:
+        source_image_path = paths["input_image"]
+        mask_image_path = paths["mask"]
+        file_name = os.path.basename(source_image_path)
+        removed_image_path = paths["edited_image"] if os.path.exists(paths["edited_image"]) else source_image_path
+
+        input_image = cv2.imread(source_image_path)
+        input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+        removed_image = cv2.imread(removed_image_path)
+        removed_image = cv2.cvtColor(removed_image, cv2.COLOR_BGR2RGB)
+        removed_mask = (cv2.imread(mask_image_path) > 128).astype(np.uint8)[:, :, 0]
+        
+        orig_input_image = input_image.copy()
+        orig_mask = removed_mask.copy()
+        
+        remove_box_yyxx = get_bbox_from_mask(removed_mask)
+        
+        ref_mask_3 = np.stack([removed_mask, removed_mask, removed_mask], -1)
+        
+        masked_ref_image = input_image * (1 - ref_mask_3) + np.ones_like(input_image) * 255 * ref_mask_3
+        
+        expand_remove_box_yyxx = expand_bbox(removed_mask, remove_box_yyxx, ratio=[1.1, 1.5])
+        
+        y1, y2, x1, x2 = expand_remove_box_yyxx
+        masked_ref_image = masked_ref_image[y1:y2, x1:x2, :]
+        
+        h, w = input_image.shape[:2]
+        target_size = buckets[find_nearest_bucket(h, w, buckets)]
+        
+        masked_ref_image = pad_to_square(masked_ref_image, pad_value=0, random=False)
+        masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), target_size).astype(np.uint8)
+        
+        masked_task_image = input_image[y1:y2, x1:x2, :]
+        masked_task_image = pad_to_square(masked_task_image, pad_value=0, random=False).astype(np.uint8)
+        masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), target_size).astype(np.uint8)
+        
+        tar_image = removed_image[y1:y2, x1:x2, :]
+        tar_image = pad_to_square(tar_image, pad_value=0, random=False).astype(np.uint8)
+        tar_image = cv2.resize(tar_image.astype(np.uint8), target_size).astype(np.uint8)
+        
+        tar_mask = ref_mask_3[y1:y2, x1:x2, :] * 255
+        tar_mask = pad_to_square(tar_mask, pad_value=0, random=False).astype(np.uint8)
+        tar_mask = cv2.resize(tar_mask.astype(np.uint8), target_size).astype(np.uint8)
+        
+        mask_black = np.ones_like(tar_image) * 0
+        diptych_ref_tar = np.concatenate([masked_ref_image, masked_task_image], axis=1)
+        mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
+        
+        diptych_ref_tar = Image.fromarray(diptych_ref_tar)
+        mask_diptych = Image.fromarray(mask_diptych)
+        
+        with torch.no_grad():
+            pipe_prior_output = pipeprior(Image.fromarray(masked_ref_image))
+        
+        for key, value in pipe_prior_output.items():
+            if isinstance(value, torch.Tensor):
+                pipe_prior_output[key] = value.to(dtype=model_dtype)
+        
+        generator = torch.Generator(accelerator.device).manual_seed(args.seed)
+        edited_image = pipefill(
+            image=diptych_ref_tar,
+            mask_image=mask_diptych,
+            height=mask_diptych.size[1],
+            width=mask_diptych.size[0],
+            max_sequence_length=512,
+            num_inference_steps=30,
+            generator=generator,
+            **pipe_prior_output,
+        ).images[0]
+        
+        # 裁剪右半部分（编辑后的图像）
+        t_width, t_height = edited_image.size
+        start_x = t_width // 2
+        edited_image = edited_image.crop((start_x, 0, t_width, t_height))
+        
+        edited_image = np.array(edited_image)
+        edited_pil = Image.fromarray(edited_image)
+        edited_resized = edited_pil.resize((x2-x1, y2-y1))
+        final_output = orig_input_image.copy()
+        final_output[y1:y2, x1:x2, :] = np.array(edited_resized)
+        final_output = Image.fromarray(final_output)
+
+        original_image = Image.fromarray(orig_input_image)
+
+        visible_mask = Image.fromarray(
+            np.where(orig_mask[:, :, None] > 0, 
+                    np.ones_like(orig_input_image) * 255, 
+                    orig_input_image).astype(np.uint8)
+        )
+        
+
+        total_width = original_image.width + visible_mask.width + final_output.width
+        composite_image = Image.new('RGB', (total_width, original_image.height))
+        
+        composite_image.paste(original_image, (0, 0))
+        composite_image.paste(visible_mask, (original_image.width, 0))
+        composite_image.paste(final_output, (original_image.width + visible_mask.width, 0))
+        
+        edited_image_save_path = os.path.join(save_dir, f"custom_seed{args.seed}_epoch_{epoch}_step_{global_step}_{file_name}")
+        composite_image.save(edited_image_save_path)
+    
     del pipefill, pipeprior
     torch.cuda.empty_cache()
     gc.collect()
@@ -389,6 +548,10 @@ def parse_args():
     parser.add_argument("--enable_xformers_memory_efficient_attention", 
                         action="store_true", default=False, 
                         help="是否启用xformers内存优化注意力机制")
+    
+    # custom 模式推理
+    parser.add_argument("--inference_custom", action="store_true", default=False, 
+                        help="是否启用custom模式推理")
     
     # 解析参数
     args = parser.parse_args()
@@ -699,7 +862,8 @@ def main():
     try:
         train_dataset = TripletBucketDataset(json_path=args.train_json_path, 
                                         buckets=buckets,
-                                        metadata_file=args.train_metadata_file)
+                                        metadata_file=args.train_metadata_file,
+                                        custom=args.inference_custom)
         
         if len(train_dataset) == 0:
             logger.error("训练数据集为空，请检查数据路径和文件格式")
@@ -856,6 +1020,7 @@ def main():
                     pil_image = Image.fromarray((image_numpy * 255).astype('uint8'))
                     
                     with torch.no_grad():
+                        # dual change here TODO pil_image
                         prompt_embed, pooled_prompt_embed = image_output(flux_redux_pipe, pil_image, device=accelerator.device)
                         prompt_embeds.append(prompt_embed.squeeze(1))
                         pooled_prompt_embeds.append(pooled_prompt_embed.squeeze(1))
@@ -885,6 +1050,7 @@ def main():
                         else None
                     )
                 
+                # 可以在此处对attention做一些training free 的优化 TODO 
                 transformer_out = tranformer_forward(
                     transformer,
                     model_config=args.transformer_config_dict,  # TODO attn_forward 中没被使用 ?
@@ -898,6 +1064,7 @@ def main():
                     joint_attention_kwargs=None,
                     return_dict=False,
                 )
+
                 pred = transformer_out[0]
                 
                 loss = torch.nn.functional.mse_loss(pred, (x_1 - x_0), reduction="mean")
@@ -961,7 +1128,10 @@ def main():
                 logger.info("Running validation...")
                 try:
                     if args.val_json_path:
-                        log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                        if args.inference_custom:
+                            log_infer_custom(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                        else:
+                            log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
                         free_memory()
                     else:
                         logger.warning("val_json_path not provided, skipping validation.")

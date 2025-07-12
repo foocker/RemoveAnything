@@ -26,6 +26,7 @@ class TripletBucketDataset(BaseDataset):
         json_path,
         buckets,
         metadata_file=None,
+        custom=False,
     ):
         super().__init__()
         self.json_path = json_path
@@ -90,6 +91,8 @@ class TripletBucketDataset(BaseDataset):
         else:
             removed_image = input_image.copy()
         
+        if self.custom:
+            return self.process_custom(input_image, removed_mask, removed_image, target_size)
         return self.process_triplets(input_image, removed_mask, removed_image, target_size)
     
     def __getitem__(self, idx):

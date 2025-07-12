@@ -163,5 +163,52 @@ class BaseDataset(Dataset):
     def process_custom(self, input_image, removed_mask, removed_image, size=(768, 768)):
         '''
         数据不一定是三元组，或者是三元组，是否使用diptych可以自定义
+        input_image: input image 需要被擦除的图
+        removed_mask: removed object 被擦除对象对应的mask
+        removed_image: 擦除后的效果
+        较triplets有两个改动：
+            1. masked_ref_img 做inverse local 改动，被消除区域外切box扩展后box做crop,然后被消除区域填白255
+            2. masked_task_img 做input crop 改动，原始图中被消除的区域外切box扩展后box做crop
+        
         '''
-        pass
+        remove_box_yyxx = get_bbox_from_mask(removed_mask)
+        
+        ref_mask_3 = np.stack([removed_mask, removed_mask, removed_mask], -1)
+        masked_ref_image = input_image * (1 - ref_mask_3) + np.ones_like(input_image) * 255 * ref_mask_3
+        
+        # 在扩展mask之前，可以先对mask做一个贝塞尔操作,这里实验想法验证，先从简
+        expand_remove_box_yyxx = expand_bbox(removed_mask, remove_box_yyxx, ratio=[1.1, 1.5])
+        
+        y1, y2, x1, x2 = expand_remove_box_yyxx
+        masked_ref_image = masked_ref_image[y1:y2, x1:x2, :]  # 第一条改动
+        
+        # 255 means re generate 0 means keep original pixel
+        masked_ref_image = pad_to_square(masked_ref_image, pad_value=0, random=False)  
+        masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
+        
+        # 第二条改动
+        masked_task_image = input_image[y1:y2, x1:x2, :]
+        masked_task_image = pad_to_square(masked_task_image, pad_value=0, random=False).astype(np.uint8)
+        masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), size).astype(np.uint8)
+        
+        tar_image = removed_image[y1:y2, x1:x2, :]
+        tar_image = pad_to_square(tar_image, pad_value=0, random=False).astype(np.uint8)
+        tar_image = cv2.resize(tar_image.astype(np.uint8), size).astype(np.uint8)
+        
+        tar_mask = ref_mask_3[y1:y2, x1:x2, :]* 255
+        tar_mask = pad_to_square(tar_mask, pad_value=0, random=False).astype(np.uint8)
+        tar_mask = cv2.resize(tar_mask.astype(np.uint8), size).astype(np.uint8)
+        
+        mask_black = np.ones_like(tar_image) * 0
+        diptych_mask = self.to_tensor(np.concatenate([mask_black, tar_mask], axis=1)) 
+        diptych_src = self.to_tensor(np.concatenate([masked_ref_image, masked_task_image], axis=1)) 
+        diptych_result = self.to_tensor(np.concatenate([masked_ref_image, tar_image], axis=1))
+        masked_ref_image = self.to_tensor(masked_ref_image)
+        
+        item = dict(
+            ref=masked_ref_image,   
+            src=diptych_src,        
+            result=diptych_result,  
+            mask=diptych_mask,      
+        )
+        return item
