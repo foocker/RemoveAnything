@@ -8,8 +8,11 @@ import math
 import time
 import gc
 import traceback
+import datetime
 import numpy as np
 import torch
+import json
+from safetensors.torch import save_file, load_file
 import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
@@ -717,17 +720,6 @@ def main():
         }
         
         logger.info("添加多个LoRA适配器")
-        # # 添加第一个LoRA适配器
-        # transformer.add_adapter("adapter1", LoraConfig(**lora_config_dict))
-        
-        # # 添加第二个LoRA适配器（可选择不同配置）
-        # lora_config_dict2 = lora_config_dict.copy()  # 可以修改此配置用于第二个适配器
-        # transformer.add_adapter("adapter2", LoraConfig(**lora_config_dict2))
-        
-        # # 设置活动适配器，可以同时激活多个适配器
-        # transformer.set_adapter(["adapter1", "adapter2"], adapter_weights=[0.7, 0.3])
-        # # 或者只激活一个用于训练
-        # # transformer.set_adapter("adapter1")
         
         # 解析适配器名称和权重
         adapter_names = args.lora_adapters.split(",")
@@ -736,10 +728,10 @@ def main():
 
         # 添加多个适配器
         for adapter_name in adapter_names:
-            transformer.add_adapter(adapter_name, LoraConfig(**lora_config_dict))
+            transformer.add_adapter(LoraConfig(**lora_config_dict), adapter_name=adapter_name)
 
         # 设置活动适配器和权重
-        transformer.set_adapter(adapter_names, adapter_weights=adapter_weights)
+        transformer.set_adapters(adapter_names, weights=adapter_weights)
         
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -748,81 +740,96 @@ def main():
     
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
-        if accelerator.is_main_process:
-            transformer_lora_layers_to_save = None
-            modules_to_save = {}
-            for model in models:
-                if isinstance(model, type(unwrap_model(transformer))):
-                    transformer_lora_layers_to_save = {}
-                    for adapter_name in model.peft_config.keys():
-                        transformer_lora_layers_to_save[adapter_name] = get_peft_model_state_dict(model, adapter_name)
-                    modules_to_save["transformer"] = model
-                else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
-                
-            for adapter_name, state_dict in transformer_lora_layers_to_save.items():
-                adapter_output_dir = os.path.join(output_dir, f"adapter_{adapter_name}")
-                os.makedirs(adapter_output_dir, exist_ok=True)
-                FluxFillPipeline.save_lora_weights(
-                    adapter_output_dir,
-                    transformer_lora_layers={adapter_name: state_dict},
-                    **_collate_lora_metadata(modules_to_save),
-                )
+        """保存合并的LoRA权重，包含所有适配器"""
+        if not accelerator.is_main_process:
+            return
+            
+        for model in models:
+            if isinstance(model, type(unwrap_model(transformer))):
+                try:
+                    # 分别保存每个LoRA适配器以保持其独立特性
+                    from peft import get_peft_model_state_dict
+                    from safetensors.torch import save_file
+                    import json
+                    
+                    # 获取所有活动适配器
+                    active_adapters = list(model.peft_config.keys())
+                    
+                    # 为每个适配器分别保存
+                    for adapter_name in active_adapters:
+                        adapter_dir = os.path.join(output_dir, f"lora_{adapter_name}")
+                        os.makedirs(adapter_dir, exist_ok=True)
+                        
+                        # 获取该适配器的权重
+                        adapter_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
+                        
+                        # 保存适配器权重
+                        save_file(adapter_state_dict, os.path.join(adapter_dir, "adapter_model.safetensors"))
+                        
+                        # 保存适配器配置
+                        adapter_config = {
+                            "adapter_name": adapter_name,
+                            "weight": adapter_weights[active_adapters.index(adapter_name)] if adapter_weights else 1.0,
+                            "timestamp": datetime.datetime.now().isoformat()
+                        }
+                        with open(os.path.join(adapter_dir, "adapter_config.json"), "w", encoding="utf-8") as f:
+                            json.dump(adapter_config, f, indent=2, ensure_ascii=False)
+                            
+                        logger.info(f"适配器 {adapter_name} 已保存到: {adapter_dir}")
+                    
+                    # 保存总体配置信息
+                    config_info = {
+                        "adapters": active_adapters,
+                        "adapter_weights": adapter_weights,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                    with open(os.path.join(output_dir, "multi_adapter_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(config_info, f, indent=2, ensure_ascii=False)
+                            
+                except Exception as e:
+                    logger.error(f"保存LoRA权重失败: {str(e)}")
+                        
+            else:
+                raise ValueError(f"意外的模型类型: {model.__class__}")
+            
+            weights.pop()
             
     def load_model_hook(models, input_dir):
+        """分别加载每个LoRA适配器，保持其独立特性"""
         transformer_ = None
         while len(models) > 0:
             model = models.pop()
             if isinstance(model, type(unwrap_model(transformer))):
                 transformer_ = model
             else:
-                raise ValueError(f"unexpected save model: {model.__class__}")
+                raise ValueError(f"意外的模型类型: {model.__class__}")
         
-        adapter_dirs = [d for d in os.listdir(input_dir) if d.startswith("adapter_") and os.path.isdir(os.path.join(input_dir, d))]
+        # 查找所有lora_*目录
+        lora_dirs = [d for d in os.listdir(input_dir) 
+                     if d.startswith("lora_") and os.path.isdir(os.path.join(input_dir, d))]
         
-        if adapter_dirs:
-            for adapter_dir in adapter_dirs:
-                adapter_path = os.path.join(input_dir, adapter_dir)
-                adapter_name = adapter_dir.replace("adapter_", "")
-                logger.info(f"从 {adapter_path} 加载适配器 {adapter_name}")
+        if lora_dirs:
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+            
+            for lora_dir in lora_dirs:
+                adapter_path = os.path.join(input_dir, lora_dir)
+                adapter_name = lora_dir.replace("lora_", "")
                 
                 try:
-                    lora_state_dict = FluxFillPipeline.lora_state_dict(adapter_path)
-                    transformer_state_dict = {
-                        f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-                    }
-                    incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name=adapter_name)
+                    # 加载适配器状态字典
+                    adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
+                    if os.path.exists(adapter_file):
+                        adapter_state_dict = load_file(adapter_file)
+                        set_peft_model_state_dict(transformer_, adapter_state_dict, adapter_name=adapter_name)
+                        logger.info(f"成功从 {adapter_path} 加载适配器 {adapter_name}")
+                    else:
+                        logger.warning(f"适配器文件不存在: {adapter_file}")
                     
-                    if incompatible_keys is not None:
-                        unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                        if unexpected_keys:
-                            logger.warning(
-                                f"加载适配器 {adapter_name} 权重时发现意外的键: {unexpected_keys}"
-                            )
                 except Exception as e:
                     logger.error(f"加载适配器 {adapter_name} 失败: {str(e)}")
         else:
-            lora_state_dict = FluxFillPipeline.lora_state_dict(input_dir)
-            transformer_state_dict = {
-                f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-            }
-            
-            adapter_name = "default"
-            if hasattr(args, "lora_adapters") and args.lora_adapters:
-                adapter_names = args.lora_adapters.split(",")
-                if adapter_names:
-                    adapter_name = adapter_names[0]
-                    
-            incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name=adapter_name)
-            if incompatible_keys is not None:
-                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                if unexpected_keys:
-                    logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
-                    )
+            logger.warning(f"在 {input_dir} 中未找到lora_*目录")
         
         # Make sure the trainable params are in float32
         if args.mixed_precision == "fp16":
@@ -1154,12 +1161,22 @@ def main():
                     
                     if args.use_lora:
                         unwrapped_transformer = accelerator.unwrap_model(transformer)
-                        FluxFillPipeline.save_lora_weights(
-                            save_directory=os.path.join(args.output_dir, f"lora-{global_step}"),
-                            transformer_lora_layers=get_peft_model_state_dict(unwrapped_transformer),
-                            safe_serialization=True,
-                        )
-                        logger.info(f"LoRA weights saved to {os.path.join(args.output_dir, f'lora-{global_step}')}")
+                        # 分别保存每个适配器以保持其特性
+                        active_adapters = list(unwrapped_transformer.peft_config.keys())
+                        
+                        for adapter_name in active_adapters:
+                            adapter_save_dir = os.path.join(args.output_dir, f"lora-{global_step}", f"adapter_{adapter_name}")
+                            os.makedirs(adapter_save_dir, exist_ok=True)
+                            
+                            # 获取该适配器的权重
+                            adapter_layers = get_peft_model_state_dict(unwrapped_transformer, adapter_name=adapter_name)
+                            
+                            FluxFillPipeline.save_lora_weights(
+                                save_directory=adapter_save_dir,
+                                transformer_lora_layers=adapter_layers,
+                                safe_serialization=True,
+                            )
+                            logger.info(f"Adapter {adapter_name} saved to {adapter_save_dir}")
                 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step_time": step_time}
             progress_bar.set_postfix(**logs)
@@ -1174,9 +1191,11 @@ def main():
             #         logger.info("Running validation...")
             #         try:
             #             if args.val_json_path:
-            #                 log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+            #                 if args.inference_custom:
+            #                     log_infer_custom(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+            #                 else:
+            #                     log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
             #                 free_memory()
-            #             else:
             #                 logger.warning("val_json_path not provided, skipping validation.")
             #         except Exception as e:
             #             logger.error(f"Inference failed with error: {e}")
@@ -1207,15 +1226,22 @@ def main():
     if accelerator.is_main_process:
         if args.use_lora:
             unwrapped_transformer = accelerator.unwrap_model(transformer)
-            lora_save_path = os.path.join(args.output_dir, "final_lora")
-            os.makedirs(lora_save_path, exist_ok=True)
+            # 分别保存每个适配器的最终权重
+            active_adapters = list(unwrapped_transformer.peft_config.keys())
             
-            FluxFillPipeline.save_lora_weights(
-                save_directory=lora_save_path,
-                transformer_lora_layers=get_peft_model_state_dict(unwrapped_transformer),
-                safe_serialization=True,
-            )
-            logger.info(f"\n训练完成！最终LoRA权重保存至 {lora_save_path}")
+            for adapter_name in active_adapters:
+                adapter_save_path = os.path.join(args.output_dir, "final_lora", f"adapter_{adapter_name}")
+                os.makedirs(adapter_save_path, exist_ok=True)
+                
+                # 获取该适配器的权重
+                adapter_layers = get_peft_model_state_dict(unwrapped_transformer, adapter_name=adapter_name)
+                
+                FluxFillPipeline.save_lora_weights(
+                    save_directory=adapter_save_path,
+                    transformer_lora_layers=adapter_layers,
+                    safe_serialization=True,
+                )
+                logger.info(f"\n适配器 {adapter_name} 最终权重保存至: {adapter_save_path}")
         else:
             unwrapped_transformer = accelerator.unwrap_model(transformer)
             final_save_path = os.path.join(args.output_dir, "final_model")

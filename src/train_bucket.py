@@ -324,15 +324,15 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
         h, w = input_image.shape[:2]
         target_size = buckets[find_nearest_bucket(h, w, buckets)]
         
-        masked_ref_image = pad_to_square(masked_ref_image, pad_value=0, random=False)
+        masked_ref_image = pad_to_square(masked_ref_image, pad_value=255, random=False)
         masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), target_size).astype(np.uint8)
         
         masked_task_image = input_image[y1:y2, x1:x2, :]
-        masked_task_image = pad_to_square(masked_task_image, pad_value=0, random=False).astype(np.uint8)
+        masked_task_image = pad_to_square(masked_task_image, pad_value=255, random=False).astype(np.uint8)
         masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), target_size).astype(np.uint8)
         
         tar_image = removed_image[y1:y2, x1:x2, :]
-        tar_image = pad_to_square(tar_image, pad_value=0, random=False).astype(np.uint8)
+        tar_image = pad_to_square(tar_image, pad_value=255, random=False).astype(np.uint8)
         tar_image = cv2.resize(tar_image.astype(np.uint8), target_size).astype(np.uint8)
         
         tar_mask = ref_mask_3[y1:y2, x1:x2, :] * 255
@@ -1108,20 +1108,23 @@ def main():
             if global_step >= args.max_train_steps:
                 break
             
-            # # debug 用，快速验证validation 
-            # if accelerator.is_main_process:
-            #     if global_step > 1 and global_step % args.validation_steps == 0:
-            #         logger.info("Running validation...")
-            #         try:
-            #             if args.val_json_path:
-            #                 log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-            #                 free_memory()
-            #             else:
-            #                 logger.warning("val_json_path not provided, skipping validation.")
-            #         except Exception as e:
-            #             logger.error(f"Inference failed with error: {e}")
-            #             traceback.print_exc()
-            #             logger.info("Inference failed, but training will continue.")
+            # debug 用，快速验证validation 
+            if accelerator.is_main_process:
+                if global_step > 1 and global_step % args.validation_steps == 0:
+                    logger.info("Running validation...")
+                    try:
+                        if args.val_json_path:
+                            if args.inference_custom:
+                                log_infer_custom(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                            else:
+                                log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+                            free_memory()
+                        else:
+                            logger.warning("val_json_path not provided, skipping validation.")
+                    except Exception as e:
+                        logger.error(f"Inference failed with error: {e}")
+                        traceback.print_exc()
+                        logger.info("Inference failed, but training will continue.")
                 
         if accelerator.is_main_process:
             if epoch > 0 and epoch % args.validation_epochs == 0:

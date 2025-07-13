@@ -32,6 +32,7 @@ class TripletBucketDataset(BaseDataset):
         self.json_path = json_path
         self.root_path = os.path.dirname(json_path)
         self.buckets = buckets
+        self.custom = custom
         
         self.triplet_paths = []
         self.bucket_indices = []

@@ -183,16 +183,16 @@ class BaseDataset(Dataset):
         masked_ref_image = masked_ref_image[y1:y2, x1:x2, :]  # 第一条改动
         
         # 255 means re generate 0 means keep original pixel
-        masked_ref_image = pad_to_square(masked_ref_image, pad_value=0, random=False)  
+        masked_ref_image = pad_to_square(masked_ref_image, pad_value=255, random=False)  
         masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), size).astype(np.uint8)
         
         # 第二条改动
         masked_task_image = input_image[y1:y2, x1:x2, :]
-        masked_task_image = pad_to_square(masked_task_image, pad_value=0, random=False).astype(np.uint8)
+        masked_task_image = pad_to_square(masked_task_image, pad_value=255, random=False).astype(np.uint8)
         masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), size).astype(np.uint8)
         
         tar_image = removed_image[y1:y2, x1:x2, :]
-        tar_image = pad_to_square(tar_image, pad_value=0, random=False).astype(np.uint8)
+        tar_image = pad_to_square(tar_image, pad_value=255, random=False).astype(np.uint8)
         tar_image = cv2.resize(tar_image.astype(np.uint8), size).astype(np.uint8)
         
         tar_mask = ref_mask_3[y1:y2, x1:x2, :]* 255

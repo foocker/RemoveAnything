@@ -61,10 +61,11 @@ def main():
     parser.add_argument('--data_json_path', type=str, required=True, help='Path to the dataset json')
     parser.add_argument('--save_dir', type=str, required=True, help='Directory to save visualizations')
     parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to visualize')
+    parser.add_argument('--custom', action='store_true', help='Use custom dataset')
     args = parser.parse_args()
     
     # Create dataset
-    dataset = TripletBucketDataset(args.data_json_path, buckets=[(512, 512)])
+    dataset = TripletBucketDataset(args.data_json_path, buckets=[(512, 512)], custom=args.custom)
     
     # Visualize samples
     for i in range(min(args.num_samples, len(dataset))):
