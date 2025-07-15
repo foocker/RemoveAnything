@@ -35,7 +35,7 @@ from diffusers.training_utils import (
     free_memory
 )
 
-from data.all_data import  load_triplet_paths, load_triplet_paths_from_dir
+from data.all_data import load_triplet_paths, load_triplet_paths_from_dir
 from models.pipeline_tools import encode_images, prepare_text_input, Flux_fill_encode_masks_images
 from models.image_project import image_output
 from models.transformer import tranformer_forward

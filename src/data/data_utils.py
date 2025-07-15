@@ -78,7 +78,7 @@ def expand_image_mask(image, mask, ratio=1.4):
     pad_param_mask = ((h1,h2),(w1,w2))
     image = np.pad(image, pad_param_image, 'constant', constant_values=255)
     mask = np.pad(mask, pad_param_mask, 'constant', constant_values=0)
-    return image, mask
+    return image, mask    
 
 
 def resize_box(yyxx, H,W,h,w):
