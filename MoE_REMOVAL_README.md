@@ -68,9 +68,25 @@ use_moe_routing = (
 
 ## 🚀 Quick Start
 
+### Method 1: Intelligent Mode (Recommended)
+
+```bash
+# Full specialized training with expert differentiation
+cp train_moe_local.sh train_moe_full.sh
+# Edit train_moe_full.sh to enable all losses:
+# --enable_base_loss \
+# --enable_mask_info \
+# --enable_boundary_loss \
+# --enable_consistency_loss \
+# --enable_detail_loss \
+bash train_moe_full.sh
+```
+
+### Method 2: Simple Mode
+
 ```bash
 # Basic training with uniform weights (current config)
-bash train_moe.sh
+bash train_moe_local.sh
 ```
 
 ## 📊 Advanced Loss System
@@ -397,6 +413,14 @@ print([k for k in model.keys() if 'lora' in k])
 4. **Added** `extract_mask_info_from_batch()` mask analysis
 5. **Enhanced** MoE routing with mask awareness
 
+### File Structure
+
+```
+src/
+├── train_bucket_moe.py          # Main training script
+├── run_moe_removal_training.sh  # Training launcher
+└── MoE_REMOVAL_README.md        # This documentation
+```
 
 ## 🎯 Expected Results
 
@@ -408,6 +432,16 @@ With proper training, you should see:
 - **Enhanced Detail Retention**: Preserved texture and fine details
 - **Intelligent Routing**: Appropriate expert selection based on mask characteristics
 
+## 📞 Support
+
+For issues or questions:
+
+1. Check the logging output for error messages
+2. Verify your dataset format matches the expected structure
+3. Monitor expert usage to ensure balanced routing
+4. Adjust loss weights based on your specific requirements
+
+---
 
 ## 🔧 Troubleshooting
 
@@ -435,7 +469,7 @@ tensorboard --logdir=./logs
 
 ## 📚 资源指南
 
-- **训练脚本**: `train_moe.sh` (路由模式)
+- **训练脚本**: `train_moe_local.sh` (基础模式), `train_moe.sh` (路由模式)
 - **日志查看**: `tensorboard --logdir=./logs`
 - **模型保存**: 每个专家适配器分别保存
 

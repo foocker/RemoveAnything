@@ -169,7 +169,6 @@ class BaseDataset(Dataset):
         较triplets有两个改动：
             1. masked_ref_img 做inverse local 改动，被消除区域外切box扩展后box做crop,然后被消除区域填白255
             2. masked_task_img 做input crop 改动，原始图中被消除的区域外切box扩展后box做crop
-        
         '''
         remove_box_yyxx = get_bbox_from_mask(removed_mask)
         

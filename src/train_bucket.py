@@ -327,12 +327,14 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
         masked_ref_image = pad_to_square(masked_ref_image, pad_value=255, random=False)
         masked_ref_image = cv2.resize(masked_ref_image.astype(np.uint8), target_size).astype(np.uint8)
         
-        masked_task_image = input_image[y1:y2, x1:x2, :]
-        masked_task_image = pad_to_square(masked_task_image, pad_value=255, random=False).astype(np.uint8)
-        masked_task_image = cv2.resize(masked_task_image.astype(np.uint8), target_size).astype(np.uint8)
+        task_image = input_image[y1:y2, x1:x2, :]
+        task_image = pad_to_square(task_image, pad_value=255, random=False).astype(np.uint8)
+        task_image = cv2.resize(task_image.astype(np.uint8), target_size).astype(np.uint8)
         
         tar_image = removed_image[y1:y2, x1:x2, :]
+        H1, W1 = tar_image.shape[:2]
         tar_image = pad_to_square(tar_image, pad_value=255, random=False).astype(np.uint8)
+        H2, W2 = tar_image.shape[:2]
         tar_image = cv2.resize(tar_image.astype(np.uint8), target_size).astype(np.uint8)
         
         tar_mask = ref_mask_3[y1:y2, x1:x2, :] * 255
@@ -340,7 +342,7 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
         tar_mask = cv2.resize(tar_mask.astype(np.uint8), target_size).astype(np.uint8)
         
         mask_black = np.ones_like(tar_image) * 0
-        diptych_ref_tar = np.concatenate([masked_ref_image, masked_task_image], axis=1)
+        diptych_ref_tar = np.concatenate([masked_ref_image, task_image], axis=1)
         mask_diptych = np.concatenate([mask_black, tar_mask], axis=1)
         
         diptych_ref_tar = Image.fromarray(diptych_ref_tar)
@@ -352,7 +354,7 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
         for key, value in pipe_prior_output.items():
             if isinstance(value, torch.Tensor):
                 pipe_prior_output[key] = value.to(dtype=model_dtype)
-        
+                
         generator = torch.Generator(accelerator.device).manual_seed(args.seed)
         edited_image = pipefill(
             image=diptych_ref_tar,
@@ -371,11 +373,8 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
         edited_image = edited_image.crop((start_x, 0, t_width, t_height))
         
         edited_image = np.array(edited_image)
-        edited_pil = Image.fromarray(edited_image)
-        edited_resized = edited_pil.resize((x2-x1, y2-y1))
-        final_output = orig_input_image.copy()
-        final_output[y1:y2, x1:x2, :] = np.array(edited_resized)
-        final_output = Image.fromarray(final_output)
+        edited_image = crop_back(edited_image, orig_input_image, np.array([H1, W1, H2, W2]), np.array(expand_remove_box_yyxx))
+        final_output = Image.fromarray(edited_image)
 
         original_image = Image.fromarray(orig_input_image)
 
@@ -384,7 +383,6 @@ def log_infer_custom(accelerator, args, save_path, epoch, global_step,
                     np.ones_like(orig_input_image) * 255, 
                     orig_input_image).astype(np.uint8)
         )
-        
 
         total_width = original_image.width + visible_mask.width + final_output.width
         composite_image = Image.new('RGB', (total_width, original_image.height))
@@ -1108,23 +1106,23 @@ def main():
             if global_step >= args.max_train_steps:
                 break
             
-            # debug 用，快速验证validation 
-            if accelerator.is_main_process:
-                if global_step > 1 and global_step % args.validation_steps == 0:
-                    logger.info("Running validation...")
-                    try:
-                        if args.val_json_path:
-                            if args.inference_custom:
-                                log_infer_custom(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-                            else:
-                                log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
-                            free_memory()
-                        else:
-                            logger.warning("val_json_path not provided, skipping validation.")
-                    except Exception as e:
-                        logger.error(f"Inference failed with error: {e}")
-                        traceback.print_exc()
-                        logger.info("Inference failed, but training will continue.")
+            # # debug 用，快速验证validation 
+            # if accelerator.is_main_process:
+            #     if global_step > 1 and global_step % args.validation_steps == 0:
+            #         logger.info("Running validation...")
+            #         try:
+            #             if args.val_json_path:
+            #                 if args.inference_custom:
+            #                     log_infer_custom(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+            #                 else:
+            #                     log_infer(accelerator, args, args.output_dir, epoch, global_step, flux_fill_pipe, flux_redux_pipe)
+            #                 free_memory()
+            #             else:
+            #                 logger.warning("val_json_path not provided, skipping validation.")
+            #         except Exception as e:
+            #             logger.error(f"Inference failed with error: {e}")
+            #             traceback.print_exc()
+            #             logger.info("Inference failed, but training will continue.")
                 
         if accelerator.is_main_process:
             if epoch > 0 and epoch % args.validation_epochs == 0:
