@@ -5,13 +5,13 @@ import numpy as np
 import PIL.Image
 import torch
 
-from ...utils import BaseOutput
+from ...utils.outputs import BaseOutput
 
 
 @dataclass
 class FluxPipelineOutput(BaseOutput):
     """
-    Output class for Stable Diffusion pipelines.
+    Output class for Flux pipelines.
 
     Args:
         images (`List[PIL.Image.Image]` or `np.ndarray`)

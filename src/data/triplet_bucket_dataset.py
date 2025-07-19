@@ -92,6 +92,7 @@ class TripletBucketDataset(BaseDataset):
         else:
             removed_image = input_image.copy()
         
+        # TODO add simple mode
         if self.custom:
             return self.process_custom(input_image, removed_mask, removed_image, target_size)
         return self.process_triplets(input_image, removed_mask, removed_image, target_size)
@@ -112,3 +113,17 @@ def triplet_collate_fn(examples):
         "mask": torch.stack(mask_values),
         "result": torch.stack(result_values),
     }
+    
+def triplet_collate_fn_simple(examples):
+    input_image = [example["input_image"] for example in examples]
+    mask = [example["mask"] for example in examples]
+    edited_image = [example["edited_image"] for example in examples]
+    # remove the masked region and keep the background harmonized,may generate the zhedang object
+    captions = [example["captions"] for example in examples] 
+    
+    return {
+        "input_image": torch.stack(input_image),
+        "mask": torch.stack(mask),
+        "edited_image": torch.stack(edited_image),
+        "captions": captions
+    }   

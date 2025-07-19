@@ -211,3 +211,77 @@ class BaseDataset(Dataset):
             mask=diptych_mask,      
         )
         return item
+    
+    def process_simple(self, input_image, removed_mask, removed_image, size=(768, 768), 
+                      enable_soft_mask=False, soft_mask_params=None):
+        '''
+        input_image: input image 需要被擦除的图
+        removed_mask: removed object 被擦除对象对应的mask
+        removed_image: 擦除后的效果
+        size: 桶大小
+        enable_soft_mask: 是否启用软mask预处理
+        soft_mask_params: 软mask参数 {"dilate_kernel_size": 3, "blur_kernel_size": 5, "sigma": 1.0}
+        此为flux_kontext_inpaint 数据
+        '''
+        input_image = self.to_tensor(input_image)
+        mask = removed_mask * 255  # add some crop expand ... TODO 
+        mask = self.to_tensor(mask) 
+        result = self.to_tensor(removed_image)
+        
+        # 可选的软mask预处理
+        soft_mask = None
+        if enable_soft_mask:
+            soft_mask = self._create_soft_mask(mask, soft_mask_params or {})
+        
+        item = dict(
+            input_image=input_image,  # input image
+            mask=mask,   # conditional mask
+            result=result,  # result image
+        )
+        
+        # 只有启用时才添加软mask
+        if soft_mask is not None:
+            item['soft_mask'] = soft_mask
+            
+        return item
+    
+    def _create_soft_mask(self, mask, params):
+        '''
+        创建软边界mask
+        '''
+        import torch
+        import torch.nn.functional as F
+        
+        # 默认参数
+        dilate_kernel_size = params.get('dilate_kernel_size', 3)
+        blur_kernel_size = params.get('blur_kernel_size', 5)
+        sigma = params.get('sigma', 1.0)
+        
+        # 确保mask是4D tensor [B, C, H, W]
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(0)
+        
+        # 膨胀操作
+        padding = dilate_kernel_size // 2
+        dilate_kernel = torch.ones(1, 1, dilate_kernel_size, dilate_kernel_size, 
+                                 device=mask.device, dtype=mask.dtype)
+        expanded_mask = F.conv2d(mask, dilate_kernel, padding=padding)
+        expanded_mask = torch.clamp(expanded_mask, 0, 1)
+        
+        # 高斯模糊
+        padding_blur = blur_kernel_size // 2
+        x = torch.arange(blur_kernel_size, dtype=mask.dtype, device=mask.device)
+        x = x - blur_kernel_size // 2
+        gauss_kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        gauss_kernel_1d = gauss_kernel_1d / gauss_kernel_1d.sum()
+        gauss_kernel_2d = gauss_kernel_1d[:, None] * gauss_kernel_1d[None, :]
+        gauss_kernel_2d = gauss_kernel_2d[None, None, :, :]
+        
+        soft_mask = F.conv2d(expanded_mask, gauss_kernel_2d, padding=padding_blur)
+        
+        # 恢复原始维度
+        if soft_mask.dim() == 4 and soft_mask.shape[0] == 1:
+            soft_mask = soft_mask.squeeze(0)
+            
+        return soft_mask
+        
