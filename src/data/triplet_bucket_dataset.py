@@ -118,7 +118,7 @@ def triplet_collate_fn_simple(examples):
     input_image = [example["input_image"] for example in examples]
     mask = [example["mask"] for example in examples]
     edited_image = [example["edited_image"] for example in examples]
-    # remove the masked region and keep the background harmonized,may generate the zhedang object
+    # remove the masked region and keep the background harmonious,may generate the zhedang object
     captions = [example["captions"] for example in examples] 
     
     return {

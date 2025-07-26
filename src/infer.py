@@ -15,6 +15,7 @@ import argparse
 import logging
 from diffusers import FluxFillPipeline, FluxPriorReduxPipeline
 from data.data_utils import get_bbox_from_mask, expand_bbox, pad_to_square, box2squre, crop_back, expand_image_mask
+from data.all_data import load_triplet_paths_from_dir
 
 # 设置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -266,6 +267,177 @@ def infer_single_image(pipe, redux, args, source_image_path, mask_image_path,
     return results
 
 
+def detect_lora_type(lora_path):
+    """检测LoRA权重的类型
+    
+    Args:
+        lora_path: LoRA权重路径
+        
+    Returns:
+        str: 'moe_experts', 'multi_adapter', 'single_lora', 或 'unknown'
+    """
+    if not os.path.exists(lora_path):
+        return 'unknown'
+    
+    # 检查是否为MoE专家型
+    moe_config_path = os.path.join(lora_path, 'moe_config.json')
+    if os.path.exists(moe_config_path):
+        return 'moe_experts'
+    
+    # 检查是否为多适配器型
+    multi_config_path = os.path.join(lora_path, 'multi_adapter_config.json')
+    if os.path.exists(multi_config_path):
+        return 'multi_adapter'
+    
+    # 检查是否为单LoRA型
+    single_lora_path = os.path.join(lora_path, 'pytorch_lora_weights.safetensors')
+    if os.path.exists(single_lora_path):
+        return 'single_lora'
+    
+    return 'unknown'
+
+
+def load_lora_weights_unified(pipe, lora_path, target_modules):
+    """统一的LoRA权重加载函数，支持三种格式
+    
+    Args:
+        pipe: FluxFillPipeline实例
+        lora_path: LoRA权重路径
+        target_modules: 目标模块列表
+        
+    Returns:
+        bool: 是否成功加载
+    """
+    import json
+    from peft import LoraConfig
+    
+    lora_type = detect_lora_type(lora_path)
+    logger.info(f"检测到LoRA类型: {lora_type}")
+    
+    transformer = pipe.transformer
+    
+    try:
+        if lora_type == 'moe_experts':
+            # MoE专家型：加载多个专家适配器
+            moe_config_path = os.path.join(lora_path, 'moe_config.json')
+            with open(moe_config_path, 'r') as f:
+                moe_config = json.load(f)
+            
+            adapter_names = moe_config.get('adapter_names', [])
+            logger.info(f"发现MoE专家: {adapter_names}")
+            
+            # 为每个专家添加适配器
+            for i, adapter_name in enumerate(adapter_names):
+                expert_dir = os.path.join(lora_path, f'lora_{adapter_name}')
+                if os.path.exists(expert_dir):
+                    logger.info(f"加载专家适配器: {adapter_name}")
+                    
+                    # 创建适配器配置
+                    lora_config = LoraConfig(
+                        r=64,
+                        lora_alpha=64,
+                        init_lora_weights="gaussian",
+                        target_modules=target_modules
+                    )
+                    
+                    # 添加适配器
+                    adapter_id = f"expert_{i}"
+                    transformer.add_adapter(lora_config, adapter_name=adapter_id)
+                    
+                    # 加载权重
+                    pipe.load_lora_weights(expert_dir, adapter_name=adapter_id)
+                    logger.info(f"成功加载专家 {adapter_name} 权重")
+                else:
+                    logger.warning(f"专家目录不存在: {expert_dir}")
+            
+            # 设置默认权重（均匀分布）
+            num_experts = len(adapter_names)
+            if num_experts > 0:
+                equal_weight = 1.0 / num_experts
+                adapter_weights = [equal_weight] * num_experts
+                pipe.set_adapters([f"expert_{i}" for i in range(num_experts)], adapter_weights)
+                logger.info(f"设置MoE专家权重: {adapter_weights}")
+            
+        elif lora_type == 'multi_adapter':
+            # 多适配器型：加载多个适配器并按配置权重混合
+            multi_config_path = os.path.join(lora_path, 'multi_adapter_config.json')
+            with open(multi_config_path, 'r') as f:
+                multi_config = json.load(f)
+            
+            adapters = multi_config.get('adapters', [])
+            adapter_weights = multi_config.get('adapter_weights', [])
+            logger.info(f"发现多适配器: {adapters}, 权重: {adapter_weights}")
+            
+            # 为每个适配器添加配置
+            loaded_adapters = []
+            for i, adapter_name in enumerate(adapters):
+                adapter_dir = os.path.join(lora_path, f'lora_{adapter_name}')
+                if os.path.exists(adapter_dir):
+                    logger.info(f"加载适配器: {adapter_name}")
+                    
+                    # 创建适配器配置
+                    lora_config = LoraConfig(
+                        r=64,
+                        lora_alpha=64,
+                        init_lora_weights="gaussian",
+                        target_modules=target_modules
+                    )
+                    
+                    # 添加适配器
+                    adapter_id = f"adapter_{i}"
+                    transformer.add_adapter(lora_config, adapter_name=adapter_id)
+                    
+                    # 加载权重
+                    pipe.load_lora_weights(adapter_dir, adapter_name=adapter_id)
+                    loaded_adapters.append(adapter_id)
+                    logger.info(f"成功加载适配器 {adapter_name} 权重")
+                else:
+                    logger.warning(f"适配器目录不存在: {adapter_dir}")
+            
+            # 设置适配器权重
+            if loaded_adapters and adapter_weights:
+                # 确保权重数量匹配
+                weights = adapter_weights[:len(loaded_adapters)]
+                if len(weights) < len(loaded_adapters):
+                    # 如果权重不足，用均匀分布补充
+                    remaining = len(loaded_adapters) - len(weights)
+                    equal_weight = (1.0 - sum(weights)) / remaining if remaining > 0 else 0
+                    weights.extend([equal_weight] * remaining)
+                
+                pipe.set_adapters(loaded_adapters, weights)
+                logger.info(f"设置多适配器权重: {weights}")
+            
+        elif lora_type == 'single_lora':
+            # 单LoRA型：传统单一适配器
+            logger.info("加载单一LoRA适配器")
+            
+            # 创建适配器配置
+            lora_config = LoraConfig(
+                r=64,
+                lora_alpha=64,
+                init_lora_weights="gaussian",
+                target_modules=target_modules
+            )
+            
+            # 添加适配器
+            transformer.add_adapter(lora_config)
+            
+            # 加载权重
+            pipe.load_lora_weights(lora_path)
+            logger.info("成功加载单一LoRA权重")
+            
+        else:
+            logger.error(f"未知的LoRA类型: {lora_type}")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"LoRA权重加载失败: {str(e)}")
+        logger.error(f"错误详情: {type(e).__name__}")
+        return False
+
+
 def load_weights(args, device, dtype):
     # 加载预训练模型
     logger.info("加载 FluxFill 模型...")
@@ -280,7 +452,7 @@ def load_weights(args, device, dtype):
         pipe._use_memory_efficient_attention_xformers = False
         logger.info("已禁用 xformers 内存优化")
     
-    transformer = pipe.transformer
+    # 定义目标模块
     target_modules = [
         "attn.to_k",
         "attn.to_q",
@@ -296,27 +468,13 @@ def load_weights(args, device, dtype):
         "ff_context.net.2",
     ]
     
-    from peft import LoraConfig
-    lora_config = LoraConfig(
-        r=64,  # 可根据训练中使用的值调整
-        lora_alpha=64,  # 可根据训练中使用的值调整
-        init_lora_weights="gaussian",
-        target_modules=target_modules
-    )
-    
-    logger.info("添加LoRA适配器配置")
-    transformer.add_adapter(lora_config)
-    
-    # 加载 LoRA 权重
+    # 使用统一的LoRA加载函数
     logger.info(f"加载 LoRA 权重: {args.lora_weights_path}")
-    try:
-        # 加载 LoRA 权重
-        pipe.load_lora_weights(args.lora_weights_path)
-        logger.info("成功加载 LoRA 权重")
-    except Exception as e:
-        logger.error(f"LoRA 适配器配置或权重加载出错: {str(e)}")
-        logger.error("请确保 PEFT 库版本与训练时一致")
-        return
+    success = load_lora_weights_unified(pipe, args.lora_weights_path, target_modules)
+    
+    if not success:
+        logger.error("LoRA权重加载失败")
+        return None, None
     
     # 加载 FluxPriorRedux 模型
     logger.info("加载 FluxPriorRedux 模型...")
@@ -346,6 +504,11 @@ def main():
     
     # 加载模型权重
     pipe, redux = load_weights(args, device, dtype)
+    
+    # 检查模型是否成功加载
+    if pipe is None or redux is None:
+        logger.error("模型加载失败，退出程序")
+        return
         
     # 设置随机种子
     set_seed(args.seed)
@@ -354,21 +517,24 @@ def main():
     
     if os.path.isdir(input_dir):
         logger.info(f"使用目录模式，解析目录: {input_dir}")
-        image_list, mask_list = parser_data_dir(input_dir)
+        triplet_paths = load_triplet_paths_from_dir(input_dir)
         
-        for source_image_path, mask_image_path in zip(image_list, mask_list):
+        for i, paths in enumerate(triplet_paths):
+            logger.info(f"处理图像 {i+1}/{len(triplet_paths)}: {paths['input_image']}")
+            source_path = paths["input_image"]
+            mask_path = paths["mask"]
+            reference_path = paths["edited_image"] if paths["edited_image"] and os.path.exists(paths["edited_image"]) else None
             infer_single_image(
                 pipe=pipe,
                 redux=redux,
                 args=args,
-                source_image_path=source_image_path,
-                mask_image_path=mask_image_path,
-                ref_image_path=source_image_path,
-                ref_mask_path=mask_image_path,
+                source_image_path=source_path,
+                mask_image_path=mask_path,
+                ref_image_path=reference_path,
+                ref_mask_path=mask_path,
                 device=device,
                 dtype=dtype
             )
-            
     else:
         # 单图片模式
         logger.info("使用单图片模式")

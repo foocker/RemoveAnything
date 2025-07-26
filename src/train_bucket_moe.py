@@ -156,8 +156,8 @@ def log_infer_moe(accelerator, args, save_path, epoch, global_step,
         tar_mask = cv2.dilate(tar_mask, kernel, iterations=iterations)
         tar_box_yyxx = get_bbox_from_mask(tar_mask)
         tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=1.2)
-        tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=2.0)
-        tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop) # crop box
+        # tar_box_yyxx_crop = expand_bbox(tar_image, tar_box_yyxx, ratio=2.0)
+        tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx) # crop box
         y1,y2,x1,x2 = tar_box_yyxx_crop
 
         old_tar_image = tar_image.copy()
@@ -335,41 +335,41 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
                         return None
                 else:
                     latent_height = latent_width = side_len
-                    logger.info(f"[DECODE] 完全平方数: {latent_height}x{latent_width}")
+                    # logger.info(f"[DECODE] 完全平方数: {latent_height}x{latent_width}")
                 
                 # 计算原始图像尺寸（用于unpack）
                 # 注意: Flux使用h, 2*w的约定，所以width需要*2
                 height = latent_height * vae_scale_factor * 2  # *2是因为Flux的packing
                 width = latent_width * vae_scale_factor * 2   # 注意：这里已经是2*w
-                logger.info(f"[DECODE] 计算的原始图像尺寸: {height}x{width} (vae_scale_factor={vae_scale_factor})")
-                logger.info(f"[DECODE] 注意: Flux使用h,2*w的约定")
+                # logger.info(f"[DECODE] 计算的原始图像尺寸: {height}x{width} (vae_scale_factor={vae_scale_factor})")
+                # logger.info(f"[DECODE] 注意: Flux使用h,2*w的约定")
                 
                 # 实现Flux的_unpack_latents逻辑将3D packed格式转为4D标准格式
                 # 避免导入问题，直接实现逻辑
                 def _unpack_latents_local(latents, height, width, vae_scale_factor):
                     batch_size, num_patches, channels = latents.shape
-                    logger.info(f"[UNPACK] 输入: batch_size={batch_size}, num_patches={num_patches}, channels={channels}")
-                    logger.info(f"[UNPACK] 目标尺寸: height={height}, width={width}, vae_scale_factor={vae_scale_factor}")
+                    # logger.info(f"[UNPACK] 输入: batch_size={batch_size}, num_patches={num_patches}, channels={channels}")
+                    # logger.info(f"[UNPACK] 目标尺寸: height={height}, width={width}, vae_scale_factor={vae_scale_factor}")
                     
                     # VAE applies 8x compression on images but we must also account for packing
                     # 确保尺寸计算正确
                     height = 2 * (int(height) // (vae_scale_factor * 2))
                     width = 2 * (int(width) // (vae_scale_factor * 2))
-                    logger.info(f"[UNPACK] 调整后的尺寸: height={height}, width={width}")
+                    # logger.info(f"[UNPACK] 调整后的尺寸: height={height}, width={width}")
                     
                     # 验证尺寸一致性
                     expected_patches = (height // 2) * (width // 2)
-                    logger.info(f"[UNPACK] 验证: expected_patches={(height // 2) * (width // 2)}, actual_patches={num_patches}")
+                    # logger.info(f"[UNPACK] 验证: expected_patches={(height // 2) * (width // 2)}, actual_patches={num_patches}")
                     
                     try:
                         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-                        logger.info(f"[UNPACK] view后的形状: {latents.shape}")
+                        # logger.info(f"[UNPACK] view后的形状: {latents.shape}")
                         
                         latents = latents.permute(0, 3, 1, 4, 2, 5)
-                        logger.info(f"[UNPACK] permute后的形状: {latents.shape}")
+                        # logger.info(f"[UNPACK] permute后的形状: {latents.shape}")
                         
                         latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
-                        logger.info(f"[UNPACK] 最终reshape后的形状: {latents.shape}")
+                        # logger.info(f"[UNPACK] 最终reshape后的形状: {latents.shape}")
                         
                         return latents
                     except Exception as e:
@@ -384,34 +384,34 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
                 # 参考fillpipe: latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
                 if hasattr(vae.config, 'scaling_factor'):
                     scaling_factor = vae.config.scaling_factor
-                    logger.info(f"[DECODE] 使用VAE scaling_factor: {scaling_factor}")
+                    # logger.info(f"[DECODE] 使用VAE scaling_factor: {scaling_factor}")
                 else:
                     scaling_factor = 0.3611  # Flux VAE默认值
-                    logger.info(f"[DECODE] 使用默认scaling_factor: {scaling_factor}")
+                    # logger.info(f"[DECODE] 使用默认scaling_factor: {scaling_factor}")
                     
                 if hasattr(vae.config, 'shift_factor'):
                     shift_factor = vae.config.shift_factor
-                    logger.info(f"[DECODE] 使用VAE shift_factor: {shift_factor}")
+                    # logger.info(f"[DECODE] 使用VAE shift_factor: {shift_factor}")
                 else:
                     shift_factor = 0.1159  # Flux VAE默认值
-                    logger.info(f"[DECODE] 使用默认shift_factor: {shift_factor}")
+                    # logger.info(f"[DECODE] 使用默认shift_factor: {shift_factor}")
                 
                 # 应用scaling和shift
                 latents_4d = (latents_4d / scaling_factor) + shift_factor
-                logger.info(f"[DECODE] scaling和shift后的latents_4d范围: [{latents_4d.min():.4f}, {latents_4d.max():.4f}]")
+                # logger.info(f"[DECODE] scaling和shift后的latents_4d范围: [{latents_4d.min():.4f}, {latents_4d.max():.4f}]")
                 
                 # 确保数据类型与VAE模型一致 (修复dtype不匹配问题)
                 # 检查VAE的参数数据类型
                 vae_dtype = next(vae.parameters()).dtype
-                logger.info(f"[DECODE] VAE模型数据类型: {vae_dtype}, latents_4d数据类型: {latents_4d.dtype}")
+                # logger.info(f"[DECODE] VAE模型数据类型: {vae_dtype}, latents_4d数据类型: {latents_4d.dtype}")
                 
                 if latents_4d.dtype != vae_dtype:
-                    logger.info(f"[DECODE] 转换latents_4d数据类型: {latents_4d.dtype} -> {vae_dtype}")
+                    # logger.info(f"[DECODE] 转换latents_4d数据类型: {latents_4d.dtype} -> {vae_dtype}")
                     latents_4d = latents_4d.to(vae_dtype)
                 
                 # VAE解码到像素空间
                 image = vae.decode(latents_4d, return_dict=False)[0]
-                logger.info(f"[DECODE] 解码后的image.shape: {image.shape}")
+                # logger.info(f"[DECODE] 解码后的image.shape: {image.shape}")
                 
                 return image
                 
@@ -449,15 +449,6 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
         losses['total_loss'] = losses['base_loss']
         return losses
     
-    # DEBUG: 打印所有输入tensor的shape信息
-    logger.info(f"=== 损失函数调试信息 ===")
-    logger.info(f"pred.shape: {pred.shape}")
-    logger.info(f"target.shape: {target.shape}")
-    if mask_info and 'mask_latent' in mask_info:
-        logger.info(f"mask_latent.shape: {mask_info['mask_latent'].shape}")
-    logger.info(f"loss_config: {loss_config}")
-    logger.info(f"vae available: {vae is not None}")
-    
     # 需要像素空间损失时，解码latent为像素
     pred_pixels = None
     target_pixels = None
@@ -476,14 +467,10 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
             try:
                 # 使用原始mask（像素空间）
                 mask = mask_info['mask'].to(device, dtype=pred_pixels.dtype)
-                logger.info(f"[BOUNDARY] 原始mask.shape: {mask.shape}")
-                logger.info(f"[BOUNDARY] pred_pixels.shape: {pred_pixels.shape}")
                 
                 # 确保mask与像素图像尺寸匹配
                 if mask.shape[2:] != pred_pixels.shape[2:]:
-                    logger.info(f"[BOUNDARY] 调整mask尺寸: {mask.shape[2:]} -> {pred_pixels.shape[2:]}")
                     mask = F.interpolate(mask, size=pred_pixels.shape[2:], mode='nearest')
-                    logger.info(f"[BOUNDARY] 调整后mask.shape: {mask.shape}")
                 
                 # 在像素空间计算梯度用于检测边缘
                 if pred_pixels.shape[2] > 1 and pred_pixels.shape[3] > 1:
@@ -501,7 +488,6 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
                     boundary_loss_y = F.mse_loss(pred_grad_y * mask_y, target_grad_y * mask_y, reduction="mean")
                     
                     losses['boundary_loss'] = (boundary_loss_x + boundary_loss_y) * loss_config['boundary_weight']
-                    logger.info(f"[BOUNDARY] boundary_loss: {losses['boundary_loss'].item():.6f}")
                 else:
                     losses['boundary_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
             except Exception as e:
@@ -526,7 +512,6 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
                 external_loss = F.mse_loss(pred_pixels * external_mask, target_pixels * external_mask, reduction="mean")
                 losses['consistency_loss'] = external_loss * loss_config['consistency_weight']
             except Exception as e:
-                logger.warning(f"Consistency loss computation failed: {e}")
                 losses['consistency_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
         else:
             losses['consistency_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
@@ -535,16 +520,12 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
         if loss_config['detail_weight'] > 0:
             # 必须在像素空间计算，因为latent是3D格式无法直接使用2D卷积
             if pred_pixels is not None and target_pixels is not None:
-                logger.info(f"[DETAIL] 在像素空间计算高频细节损失")
-                logger.info(f"[DETAIL] pred_pixels.shape: {pred_pixels.shape}, target_pixels.shape: {target_pixels.shape}")
-                
                 try:
                     # 使用Laplacian算子检测高频细节
                     laplacian_kernel = torch.tensor([[[[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]]], 
                                                    device=device, dtype=pred_pixels.dtype)
                     # 为每个通道创建卷积核
                     laplacian_kernel = laplacian_kernel.repeat(pred_pixels.shape[1], 1, 1, 1)
-                    logger.info(f"[DETAIL] laplacian_kernel.shape: {laplacian_kernel.shape}")
                     
                     # 在像素空间应用Laplacian算子
                     pred_detail = F.conv2d(pred_pixels, laplacian_kernel, padding=1, groups=pred_pixels.shape[1])
@@ -552,12 +533,9 @@ def compute_removal_task_loss(pred, target, mask_info=None, weighting=None, loss
                     
                     detail_loss = F.mse_loss(pred_detail, target_detail, reduction="mean")
                     losses['detail_loss'] = detail_loss * loss_config['detail_weight']
-                    logger.info(f"[DETAIL] detail_loss: {losses['detail_loss'].item():.6f}")
                 except Exception as e:
-                    logger.warning(f"Detail loss computation failed: {e}")
                     losses['detail_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
             else:
-                logger.info(f"[DETAIL] 跳过细节损失：需要VAE解码但pred_pixels/target_pixels为None")
                 losses['detail_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
         else:
             losses['detail_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
@@ -1052,14 +1030,6 @@ class MoELoRAManager:
             
         with torch.set_grad_enabled(self.router.training):
             adapter_weights = self.router(features, mask_info=mask_info, task_hint=task_hint)
-            
-            # 调试信息: 输出路由器的实际输出
-            logger.info(f"[ROUTER] 路由器原始输出 shape: {adapter_weights.shape}")
-            logger.info(f"[ROUTER] 路由器权重样例 [0]: {adapter_weights[0].detach().cpu().tolist()}")
-            if adapter_weights.shape[0] > 1:
-                logger.info(f"[ROUTER] 路由器权重样例 [1]: {adapter_weights[1].detach().cpu().tolist()}")
-            logger.info(f"[ROUTER] 批次平均权重: {adapter_weights.mean(dim=0).detach().cpu().tolist()}")
-            
             return adapter_weights
     
     def set_adapter_weights(self, weights):
@@ -2146,11 +2116,8 @@ def main():
                 target = (x_1 - x_0).float()
                 
                 # DEBUG: 输出关键形状信息
-                if global_step % 50 == 0:
+                if global_step % 500 == 0:
                     logger.info(f"=== 训练步骤 {global_step} 的形状信息 ===")
-                    logger.info(f"pred.shape: {pred.shape}")
-                    logger.info(f"target.shape: {target.shape}")
-                    logger.info(f"weighting.shape: {weighting.shape}")
                     
                     # 只在真正使用MoE路由时才显示路由统计
                     if use_moe_routing:
@@ -2185,7 +2152,7 @@ def main():
                 loss = loss_dict['total_loss']
                 
                 # 记录各组件损失（用于监控和调试）
-                if accelerator.is_main_process and global_step % 50 == 0:
+                if accelerator.is_main_process and global_step % 500 == 0:
                     component_losses = {
                         f"loss/{k}": v.item() if isinstance(v, torch.Tensor) else v 
                         for k, v in loss_dict.items()
