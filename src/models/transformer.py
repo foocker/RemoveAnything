@@ -187,4 +187,21 @@ def tranformer_forward(
             interval_control = len(self.single_transformer_blocks) / len(
                 controlnet_single_block_samples
             )
-    
+            interval_control = int(np.ceil(interval_control))
+            hidden_states[:, encoder_hidden_states.shape[1] :, ...] = (
+                hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+                + controlnet_single_block_samples[index_block // interval_control]
+            )
+
+    hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+
+    hidden_states = self.norm_out(hidden_states, temb)
+    output = self.proj_out(hidden_states)
+
+    if USE_PEFT_BACKEND:
+        # remove `lora_scale` from each PEFT layer
+        unscale_lora_layers(self, lora_scale)
+
+    if not return_dict:
+        return (output,)
+    return Transformer2DModelOutput(sample=output)

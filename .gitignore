@@ -1,5 +1,5 @@
 train_local.sh
-infer_local.sh
+# infer_local.sh
 train_local_dis.sh
 run_local.sh
 .idea
@@ -17,4 +17,5 @@ check_checkpoint_lora.py
 sample_dataset.py
 
 local_scripts
-train_moe_local.sh
+# train_moe_local.sh
+examples/*
